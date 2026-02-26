@@ -24,6 +24,8 @@ import click
 import requests
 from pathlib import Path
 from typing import Optional, List, Dict
+from github import Github, Auth
+from github.GitRelease import GitRelease
 
 
 class GitHubReleaseDownloader:
@@ -209,7 +211,7 @@ class GitHubReleaseDownloader:
         if save_dir is None:
             save_dir = f"./origin/{repo}"
         print(f"\n{'=' * 50}")
-        print(f"GitHub Release 下载器")
+        print("GitHub Release Downloader")
         print(f"{'=' * 50}")
         print(f"仓库: {owner}/{repo}")
         print(f"保存目录: {save_dir}")
@@ -242,7 +244,7 @@ class GitHubReleaseDownloader:
             return False
 
         print(f"资产数量: {len(assets)}")
-        print(f"\n可用资产：")
+        print("\n可用资产：")
         for i, asset in enumerate(assets, 1):
             print(f"  {i}. {asset['name']} (大小: {asset['size_mb']} MB)")
         print()
