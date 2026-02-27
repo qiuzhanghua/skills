@@ -24,9 +24,13 @@ import click
 import requests
 from pathlib import Path
 from typing import Optional, List, Dict
-from github import Github, Auth
-from github.GitRelease import GitRelease
 
+try:
+    from github import Github, Auth
+    from github.GitRelease import GitRelease
+except ImportError:
+    print("Error: lack of required dependencies. Please check code above.")
+    sys.exit(1)
 
 class GitHubReleaseDownloader:
     """GitHub Release下载器类"""
