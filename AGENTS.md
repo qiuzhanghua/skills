@@ -2,33 +2,31 @@
 
 ## Project Overview
 
-This is a skills repository containing:
+This is a skills repository containing documentation and scripts:
 - `skills/cot-cli/` - Documentation for the Cot CLI tool (Cross OS Toolkit)
 - `skills/github-release-downloader/` - Python script for downloading GitHub Release assets
 
-## Running the Python Script
+## Running Scripts
 
-The main script is located at `skills/github-release-downloader/scripts/download_release.py`.
-
-### Using uv (Recommended)
+### Python Script (github-release-downloader)
 
 ```bash
+# Using uv (recommended - auto-installs dependencies)
 uv run skills/github-release-downloader/scripts/download_release.py <owner> <repo>
 uv run skills/github-release-downloader/scripts/download_release.py owner repo --tag v1.0.0
 uv run skills/github-release-downloader/scripts/download_release.py owner repo --asset-name "linux" --save-dir ./downloads
+
+# Requirements: Python 3.12+, pygithub, requests, click
+# Optional: GITHUB_TOKEN env var for higher API rate limits
 ```
 
-### Requirements
+## Build/Lint/Test Commands
 
-- Python 3.12+
-- Dependencies (auto-installed by uv):
-  - `pygithub` - GitHub API client
-  - `requests` - HTTP library for downloads
-  - `click` - CLI framework
+**No formal build, lint, or test commands are configured.**
 
-### Environment Variables
-
-- `GITHUB_TOKEN` - Optional GitHub personal access token for higher API rate limits
+- **Testing**: No tests exist. If added, use `pytest` framework with `tests/test_*.py` naming
+- **Linting**: Not configured. If added, consider `ruff`, `black`, or `mypy`
+- **Single test**: Would run with `pytest tests/test_file.py::test_function`
 
 ## Code Style Guidelines
 
@@ -37,44 +35,39 @@ uv run skills/github-release-downloader/scripts/download_release.py owner repo -
 - Follow [PEP 8](https://peps.python.org/pep-0008/) style guide
 - Use 4 spaces for indentation (not tabs)
 - Maximum line length: 100 characters
-- Use type hints for function arguments and return values
+- Use type hints for all function arguments and return values
 - Use `Optional[T]` instead of `T | None` for Python 3.10 compatibility
 - Use `f-strings` for string formatting
 
 ### Naming Conventions
 
-- **Classes**: `PascalCase` (e.g., `GitHubReleaseDownloader`)
-- **Functions/Methods**: `snake_case` (e.g., `download_asset`, `get_latest_release`)
-- **Variables**: `snake_case` (e.g., `download_url`, `save_dir`)
-- **Constants**: `UPPER_SNAKE_CASE` (e.g., `SUPPORTED_EXTENSIONS`)
-- **Private methods**: Prefix with underscore (e.g., `_internal_method`)
+| Type | Convention | Example |
+|------|------------|---------|
+| Classes | PascalCase | `GitHubReleaseDownloader` |
+| Functions/Methods | snake_case | `download_asset` |
+| Variables | snake_case | `download_url` |
+| Constants | UPPER_SNAKE_CASE | `SUPPORTED_EXTENSIONS` |
+| Private methods | Prefix with `_` | `_internal_method` |
 
-### Imports
-
-- Group imports in this order:
-  1. Standard library imports (`os`, `sys`, `pathlib`)
-  2. Third-party imports (`click`, `requests`, `github`)
-  3. Local application imports
+### Imports Order
 
 ```python
+# 1. Standard library
 import os
 import sys
 from pathlib import Path
 from typing import Optional, List, Dict
 
+# 2. Third-party
 import click
 import requests
 from github import Github, Auth
 
+# 3. Local application
 from mymodule import MyClass
 ```
 
 ### Type Hints
-
-Always use type hints for:
-- Function arguments
-- Function return values
-- Class attributes
 
 ```python
 def download_asset(
@@ -95,7 +88,7 @@ try:
     response = requests.get(download_url, stream=True, timeout=300)
     response.raise_for_status()
 except requests.exceptions.RequestException as e:
-    print(f"\n下载失败: {e}")
+    print(f"\nError: {e}")
     if file_path.exists():
         file_path.unlink()
     return False
@@ -108,21 +101,20 @@ except requests.exceptions.RequestException as e:
 
 ```python
 def get_latest_release(self, owner: str, repo: str) -> Optional[GitRelease]:
-    """
-    获取仓库的最新Release
+    """Get the latest release for a repository.
 
     Args:
-        owner: 仓库所有者
-        repo: 仓库名称
+        owner: Repository owner
+        repo: Repository name
 
     Returns:
-        最新Release对象，如果不存在则返回None
+        Latest Release object, or None if not found
     """
 ```
 
-### Docstrings in SKILL.md Files
+### SKILL.md Format
 
-SKILL.md files follow a specific format with YAML front matter:
+Files use YAML front matter:
 
 ```yaml
 ---
@@ -133,15 +125,6 @@ metadata:
 license: MIT
 ---
 ```
-
-### Git Workflow
-
-- Create feature branches for new changes
-- Write meaningful commit messages
-- Do not commit:
-  - API tokens or secrets
-  - Large binary files
-  - Generated files (use .gitignore)
 
 ### File Paths
 
@@ -156,41 +139,13 @@ save_path = Path(save_dir)
 save_path.mkdir(parents=True, exist_ok=True)
 ```
 
-### Testing
+### Git Workflow
 
-There are no formal tests in this repository. When adding tests:
-- Use `pytest` framework
-- Place tests in a `tests/` directory
-- Test file naming: `test_*.py`
+- Create feature branches for new changes
+- Write meaningful commit messages
+- Do not commit: API tokens, secrets, large binaries, generated files (use .gitignore)
 
-### Linting
-
-No formal linter is configured. For Python, consider using:
-- `ruff` - Fast Python linter
-- `black` - Code formatter
-- `mypy` - Type checker
-
-If adding linting, add configuration to `pyproject.toml` or `setup.cfg`.
-
-## Common Tasks
-
-### Running the Downloader
-
-```bash
-# Download latest release
-uv run skills/github-release-downloader/scripts/download_release.py microsoft vscode
-
-# Download specific tag
-uv run skills/github-release-downloader/scripts/download_release.py owner repo --tag v1.0.0
-
-# Download to custom directory
-uv run skills/github-release-downloader/scripts/download_release.py owner repo --save-dir ./my-downloads
-
-# Filter by asset name
-uv run skills/github-release-downloader/scripts/download_release.py owner repo --asset-name "linux"
-```
-
-### Adding a New Skill
+## Adding a New Skill
 
 1. Create directory under `skills/`
 2. Add `SKILL.md` with YAML front matter
