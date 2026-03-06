@@ -1,6 +1,6 @@
 ---
 name: github-release-downloader
-description: Claude Skill for downloading GitHub Release assets / 从GitHub仓库下载最新Release资产的Claude Skill
+description: Skill for downloading GitHub Release assets / 从GitHub仓库下载最新Release资产的Claude Skill
 metadata:
   author: 邱张华(qiuzhanghua@msn.com)
 license: MIT
