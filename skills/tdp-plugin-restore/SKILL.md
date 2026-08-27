@@ -10,10 +10,11 @@ This skill restores a specified TDP plugin from an external USB drive to local s
 **Local paths:**
 - Origin: `~/space/tdp-scripts/origin/<plugin name>/`
 - Plugin: `~/space/tdp-scripts/plugin/<plugin name>_*`
+- Bin: `~/space/tdp-scripts/bin/<plugin name>_*`
 
 **USB paths:**
-- Mac: `/Volumes/SanDisk/origin/`, `/Volumes/SanDisk/plugin/`
-- Linux: `/mnt/f/origin/`, `/mnt/f/plugin/`
+- Mac: `/Volumes/SanDisk/origin/`, `/Volumes/SanDisk/plugin/`, `/Volumes/SanDisk/bin/`
+- Linux: `/mnt/f/origin/`, `/mnt/f/plugin/`, `/mnt/f/bin/`
 
 **Rules:**
 - No compression
@@ -30,7 +31,7 @@ When the user requests a restore operation, extract the **plugin name** from the
 
 1. Detect OS and set USB base path accordingly
 2. Verify USB paths exist; if not, prompt the user to connect the USB drive
-3. For both `origin` and `plugin` directories:
+3. For `origin`, `plugin`, and `bin` directories:
    a. Remove all contents at the local destination for this plugin
    b. Copy from USB to local recursively
 4. Report completion with summary of what was restored
