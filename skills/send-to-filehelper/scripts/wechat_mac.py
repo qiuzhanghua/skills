@@ -46,6 +46,8 @@ SEND_SETTLE = 1.0
 RETURN_KEYCODE = 36
 V_KEYCODE = 9
 A_KEYCODE = 0
+F_KEYCODE = 3
+ESC_KEYCODE = 53
 
 PERMISSION_HINT = (
     "需要给「运行本命令的宿主 App」授予辅助功能权限：\n"
@@ -61,6 +63,7 @@ try:  # pragma: no cover - 依赖导入
         AXIsProcessTrusted,
         AXUIElementCopyAttributeValue,
         AXUIElementCreateApplication,
+        AXUIElementCopyElementAtPosition,
         AXUIElementPerformAction,
         AXUIElementSetAttributeValue,
         AXUIElementSetMessagingTimeout,
@@ -174,6 +177,20 @@ def ax_error_name(err: int) -> str:
     return AX_ERROR_NAMES.get(err, f"error {err}")
 
 
+def _count(value: Any) -> Optional[int]:
+    """AX 数组类属性的元素个数；pyobjc 返回的不一定是 list/tuple。"""
+    if value is None:
+        return None
+    try:
+        return len(value)  # type: ignore[arg-type]
+    except TypeError:
+        pass
+    try:
+        return sum(1 for _ in value)
+    except TypeError:
+        return None
+
+
 def ax_copy(element: Any, attribute: str) -> Tuple[int, Any]:
     """返回 (AX 错误码, 值)，便于诊断。"""
     try:
@@ -181,7 +198,8 @@ def ax_copy(element: Any, attribute: str) -> Tuple[int, Any]:
     except Exception as exc:  # pyobjc 在元素失效时可能直接抛异常
         _debug(f"copy {attribute} 异常: {exc}")
         return -25202, None
-    if err != 0:
+    # attributeUnsupported / noValue 是遍历树时的常态，不刷屏
+    if err not in (0, -25205, -25212):
         _debug(f"copy {attribute} -> {ax_error_name(err)}")
     return err, value
 
@@ -304,20 +322,31 @@ class MacWeChat:
             apps = AppKit.NSRunningApplication.runningApplicationsWithBundleIdentifier_(
                 BUNDLE_ID
             )
-            if apps:
-                version = apps[0].bundleVersion()
+        except Exception as exc:
+            _debug(f"枚举微信进程失败: {exc}")
+            return None
+        if not apps:
+            return None
+        app = apps[0]
+        try:
+            getter = getattr(app, "bundleVersion", None)
+            if callable(getter):
+                version = getter()
                 if version:
                     return str(version)
-                bundle_url = apps[0].bundleURL()
-                if bundle_url is not None:
-                    plist_path = bundle_url.path() + "/Contents/Info.plist"
-                    with open(plist_path, "rb") as handle:
-                        info = plistlib.load(handle)
-                    for key in ("CFBundleShortVersionString", "CFBundleVersion"):
-                        if info.get(key):
-                            return str(info[key])
         except Exception as exc:
-            _debug(f"读取微信版本失败: {exc}")
+            _debug(f"bundleVersion 不可用: {exc}")
+        try:
+            bundle_url = app.bundleURL()
+            if bundle_url is not None:
+                plist_path = bundle_url.path() + "/Contents/Info.plist"
+                with open(plist_path, "rb") as handle:
+                    info = plistlib.load(handle)
+                for key in ("CFBundleShortVersionString", "CFBundleVersion"):
+                    if info.get(key):
+                        return str(info[key])
+        except Exception as exc:
+            _debug(f"读取 Info.plist 失败: {exc}")
         return None
 
     @property
@@ -445,29 +474,82 @@ class MacWeChat:
             )
         return lines
 
+    def element_at(self, x: float, y: float) -> Any:
+        """屏幕坐标命中测试：即使应用不暴露子元素树也能拿到该点的元素。"""
+        try:
+            err, element = AXUIElementCopyElementAtPosition(
+                self.ax_app, float(x), float(y), None
+            )
+        except Exception as exc:
+            _debug(f"命中测试 ({x:.0f},{y:.0f}) 异常: {exc}")
+            return None
+        if err != 0:
+            _debug(f"命中测试 ({x:.0f},{y:.0f}) -> {ax_error_name(err)}")
+            return None
+        return element
+
+    # 命中测试采样点：窗口内的相对坐标
+    HIT_SAMPLES = (
+        ("标题栏", 0.5, 0.02),
+        ("会话列表", 0.12, 0.30),
+        ("聊天区", 0.60, 0.40),
+        ("输入区", 0.60, 0.93),
+    )
+
+    def hit_test_lines(self) -> List[str]:
+        frame = self._window_frame()
+        if frame is None:
+            return ["命中测试: 无可用窗口"]
+        wx, wy, ww, wh = frame
+        lines: List[str] = []
+        for label, fx, fy in self.HIT_SAMPLES:
+            element = self.element_at(wx + ww * fx, wy + wh * fy)
+            if element is None:
+                lines.append(f"命中测试 {label}: 无元素")
+                continue
+            role = ax_get(element, kAXRoleAttribute) or "?"
+            identifier = ax_get(element, kAXIdentifierAttribute) or ""
+            title = ax_get(element, kAXTitleAttribute) or ""
+            value = ax_get(element, kAXValueAttribute) or ""
+            extra = f" title={str(title)[:30]!r}" if title else ""
+            if not extra and value:
+                extra = f" value={str(value)[:30]!r}"
+            lines.append(f"命中测试 {label}: {role} #{identifier or '-'}{extra}")
+        return lines
+
     def probe(self) -> List[str]:
         """对应用元素做最小 AX 探测，输出人类可读的诊断行。
 
-        用来区分三类失败：AX 被拦截（返回错误码）、应用根本没有窗口、
-        或树能读但标识不认识（版本差异）。
+        用来区分三类失败：AX 被拦截（返回错误码）、应用没有窗口、
+        或窗口在但内容树为空（微信未暴露，需要键盘兜底）。
         """
         lines: List[str] = []
         role_err, role = ax_copy(self.ax_app, kAXRoleAttribute)
         lines.append(f"应用元素 AXRole -> {role!r} ({ax_error_name(role_err)})")
 
         win_err, win_value = ax_copy(self.ax_app, kAXWindowsAttribute)
-        count = len(win_value) if isinstance(win_value, (list, tuple)) else 0
-        lines.append(f"AXWindows -> {count} 个 ({ax_error_name(win_err)})")
+        lines.append(
+            f"AXWindows -> {_count(win_value)} 个 "
+            f"[{type(win_value).__name__}] ({ax_error_name(win_err)})"
+        )
 
         children_err, children = ax_copy(self.ax_app, kAXChildrenAttribute)
-        child_count = len(children) if isinstance(children, (list, tuple)) else 0
-        lines.append(f"AXChildren -> {child_count} 个 ({ax_error_name(children_err)})")
+        lines.append(
+            f"AXChildren -> {_count(children)} 个 "
+            f"[{type(children).__name__}] ({ax_error_name(children_err)})"
+        )
 
         focused_err, focused = ax_copy(self.ax_app, kAXFocusedWindowAttribute)
         lines.append(
             f"AXFocusedWindow -> {'有' if focused is not None else '无'} "
             f"({ax_error_name(focused_err)})"
         )
+
+        for window in self.windows()[:1]:
+            window_children = ax_get(window, kAXChildrenAttribute)
+            lines.append(f"主窗口子元素 -> {_count(window_children)} 个")
+
+        lines.extend(self.hit_test_lines())
         return lines
 
     def try_enable_enhanced_ui(self) -> List[Tuple[str, int]]:
@@ -662,11 +744,88 @@ class MacWeChat:
             return role == kAXTextAreaRole and identifier == INPUT_FIELD_ID
 
         field = dfs(self.ax_app, is_input)
-        if field is None:
-            raise MacBackendError(
-                "未能定位微信输入框（chat_input_field）。请确认已打开某个会话窗口。"
-            )
-        return field
+        if field is not None:
+            return field
+
+        # 回退：应用没有暴露子元素树时，用命中测试找输入区
+        frame = self._window_frame()
+        if frame is not None:
+            wx, wy, ww, wh = frame
+            for fx, fy in ((0.60, 0.93), (0.75, 0.93), (0.60, 0.88)):
+                element = self.element_at(wx + ww * fx, wy + wh * fy)
+                if element is not None and ax_get(element, kAXRoleAttribute) in (
+                    kAXTextAreaRole,
+                    "AXTextField",
+                ):
+                    return element
+
+        raise MacBackendError(
+            "未能定位微信输入框（chat_input_field）。请确认已打开某个会话窗口，"
+            "或改用 --input-mode keystrokes。"
+        )
+
+    def ax_content_usable(self) -> bool:
+        """微信是否真的把界面内容暴露给了辅助功能。"""
+        try:
+            if self.current_chat():
+                return True
+        except Exception:
+            pass
+        try:
+            if self.sidebar_rows():
+                return True
+        except Exception:
+            pass
+        try:
+            self._input_field()
+            return True
+        except MacBackendError:
+            return False
+
+    # -- 键盘兜底（不依赖 AX 内容树） ------------------------------------- #
+    def focus_search_by_keys(self) -> None:
+        _keyboard(ESC_KEYCODE)
+        time.sleep(0.2)
+        _keyboard(F_KEYCODE, command=True)
+        time.sleep(0.5)
+
+    def open_chat_by_keys(self, target: str) -> None:
+        """Esc → Cmd+F → 粘贴目标名 → 回车。
+
+        微信 Mac 的搜索框与输入框都能接受 Cmd+V，这条路径不依赖任何 AX
+        标识，但因此也无法在发送前读取会话标题做校验。
+        """
+        self.focus_search_by_keys()
+        self.set_text_clipboard(target)
+        time.sleep(0.15)
+        _keyboard(V_KEYCODE, command=True)
+        time.sleep(0.7)
+        _keyboard(RETURN_KEYCODE)
+        time.sleep(0.9)
+
+    def send_text_by_keys(self, text: str) -> None:
+        self.set_text_clipboard(text)
+        time.sleep(0.15)
+        self.paste()
+        time.sleep(0.4)
+        self.press_return()
+        time.sleep(0.6)
+
+    def send_files_by_keys(
+        self, paths: Sequence[str], batch: bool = True, interval: float = 0.8
+    ) -> None:
+        batches: List[Sequence[str]] = (
+            [list(paths)] if batch else [[path] for path in paths]
+        )
+        for index, chunk in enumerate(batches):
+            self.set_files_clipboard(chunk)
+            time.sleep(0.2)
+            self.paste()
+            time.sleep(PASTE_SETTLE)
+            self.press_return()
+            time.sleep(SEND_SETTLE)
+            if index + 1 < len(batches):
+                time.sleep(max(interval, 0.3))
 
     def focus_input(self) -> None:
         AXUIElementPerformAction(self._input_field(), kAXRaiseAction)

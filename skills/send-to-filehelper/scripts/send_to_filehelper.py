@@ -458,6 +458,7 @@ def run_macos_backend(
     delay: float,
     retries: int,
     no_verify: bool,
+    input_mode: str = "auto",
 ) -> Report:
     from wechat_mac import MacBackendError, MacWeChat
 
@@ -477,6 +478,44 @@ def run_macos_backend(
             f"macOS 端无法像 Windows 那样二次确认好友身份；即将发送给「{target}」，"
             "请确认名称准确无误。"
         )
+
+    use_keys = input_mode == "keystrokes"
+    if input_mode == "auto":
+        try:
+            usable = wx.ax_content_usable()
+        except Exception as exc:
+            usable = False
+            warn(f"读取辅助功能内容失败: {exc}")
+        if not usable:
+            use_keys = True
+            warn(
+                "微信没有向辅助功能暴露界面内容（AX 树为空），已自动切换到键盘模式："
+                "用 Cmd+F 搜索 + 剪贴板粘贴发送。"
+            )
+
+    if use_keys:
+        warn(
+            f"键盘模式无法在发送前校验会话、也无法在发送后校验消息，"
+            f"即将直接发送给「{target}」——请确认这个名称在微信里完全正确。"
+        )
+        report.target = target
+        report.verify_note = "键盘模式（AX 树为空）不做会话/消息校验"
+        try:
+            wx.open_chat_by_keys(target)
+            if message:
+                wx.send_text_by_keys(message)
+                info(f"已发送文本消息: {message}")
+                if delay > 0:
+                    time.sleep(delay)
+            info(f"粘贴文件并发送: {'、'.join(path.name for path in files)}")
+            wx.send_files_by_keys(
+                [str(path) for path in files], batch=not one_by_one, interval=delay
+            )
+        except MacBackendError as exc:
+            report.abort = str(exc)
+            return report
+        report.submitted = list(files)
+        return report
 
     try:
         opened, current, candidates = wx.open_chat(target, exact=exact)
@@ -620,19 +659,11 @@ def check_environment(debug: bool = False) -> int:
         for line in wx.probe():
             info(f"  {line}")
         if not windows:
-            related = wx.related_processes()
-            if related:
-                info("微信相关进程及其 AX 窗口:")
-                for line in related:
-                    info(f"  {line}")
             fail(
                 "AX 树里没有任何窗口。两种可能：\n"
                 "  1. 微信主窗口确实没打开 → 点 Dock 栏的微信图标打开主窗口；\n"
-                "  2. 当前进程的辅助功能调用被沙箱/包装环境拦截 → 改在系统自带的 "
-                "Terminal.app 或 iTerm 里直接运行本命令（不要经由 IDE 的沙箱终端或"
-                "其它包装过的 shell）。\n"
-                "  上面的 AX 错误码可以区分两者：出现 cannotComplete / apiDisabled / "
-                "invalidUIElement 基本都是第 2 种。"
+                "  2. 当前进程的辅助功能调用被拦截 → 确认授予辅助功能的宿主 App "
+                "就是运行本命令的终端（Terminal / iTerm / Ghostty 等）。"
             )
             return 1
 
@@ -655,32 +686,35 @@ def check_environment(debug: bool = False) -> int:
 
         if current:
             ok(f"会话标题可读，当前会话: {current}")
-        else:
-            problems.append(
-                "无法读取会话标题（big_title_line_h_view / big_line_h_view）。"
-            )
         info(f"会话列表可见行数: {row_count}")
         if row_count:
             info("会话示例: " + "、".join(row.name for row in wx.sidebar_rows()[:5]))
         if input_ok:
             ok("聊天输入框可定位（chat_input_field）")
-        else:
-            problems.append("未能定位聊天输入框（chat_input_field）。")
 
-        if problems:
-            for item in problems:
-                fail(item)
-            click.echo("")
-            info("当前 AX 树片段（角色 / 标识 / 标题），可用于适配你的微信版本：")
-            for line in wx.debug_dump(limit=40):
-                click.echo("  " + line)
-            info(
-                "若窗口数为 1 但仍找不到会话/输入框元素，说明该微信版本未暴露这些标识；"
-                "请把上面的片段反馈给 skill 维护者（或用 --debug 查看 AX 错误码）。"
-            )
-            return 1
+        if current or row_count or input_ok:
+            ok("macOS 后端自检通过（辅助功能模式：可在发送前校验会话）")
+            return 0
 
-        ok("macOS 后端自检通过")
+        # 窗口在，但微信完全不暴露聊天界面（微信 4.1.x 实测如此）
+        warn(
+            "微信窗口存在，但客户端没有通过辅助功能暴露聊天界面：\n"
+            "  只暴露了菜单栏（Apple/文件/编辑/…），没有 session_item_*、"
+            "chat_input_field 等元素；\n"
+            "  AXEnhancedUserInterface / AXManualAccessibility 与命中测试都返回 "
+            "notImplemented —— 这是微信客户端自身的行为，不是权限或终端问题。"
+        )
+        click.echo("")
+        info("AX 树片段（角色 / 标识 / 标题）：")
+        for line in wx.debug_dump(limit=12):
+            click.echo("  " + line)
+        click.echo("")
+        ok(
+            "macOS 后端自检通过（键盘模式）：\n"
+            "  发送时会自动改用 Cmd+F 搜索 + 剪贴板粘贴（--input-mode auto 的默认行为）。\n"
+            "  代价：无法在发送前校验会话、也无法在发送后校验消息 —— 目标名称必须完全正确\n"
+            "  （默认的「文件传输助手」最安全）。"
+        )
         return 0
 
     fail(f"不支持的平台: {platform}（仅支持 Windows 与 macOS）")
@@ -757,6 +791,13 @@ def check_environment(debug: bool = False) -> int:
     help="只做环境自检（权限/微信/后端可用性）。",
 )
 @click.option(
+    "--input-mode",
+    type=click.Choice(["auto", "ax", "keystrokes"]),
+    default="auto",
+    show_default=True,
+    help="macOS 输入方式：auto 自动选择；ax 只用辅助功能；keystrokes 只用键盘（Windows 忽略）。",
+)
+@click.option(
     "--debug",
     is_flag=True,
     default=False,
@@ -778,6 +819,7 @@ def main(
     no_verify: bool,
     dry_run: bool,
     check_only: bool,
+    input_mode: str,
     debug: bool,
     as_json: bool,
 ) -> None:
@@ -841,7 +883,15 @@ def main(
 
     if platform == "darwin":
         report = run_macos_backend(
-            resolved, target, exact, message, one_by_one, delay, retries, no_verify
+            resolved,
+            target,
+            exact,
+            message,
+            one_by_one,
+            delay,
+            retries,
+            no_verify,
+            input_mode=input_mode,
         )
     else:
         report = run_windows_backend(

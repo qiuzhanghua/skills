@@ -49,26 +49,43 @@ automated outreach. It is intended only for the user's own account and conversat
 
 | Item | Windows | macOS |
 | --- | --- | --- |
-| OS | Windows 10 / 11 | macOS（针对 macOS 15 + 微信 4.1.13 编写；需授予辅助功能权限后自测） |
+| OS | Windows 10 / 11 | macOS（macOS 15 + 微信 4.1.13 实测） |
 | Client | Windows 版微信 **4.x**，已登录，主窗口未最小化 | 微信 Mac 版 **4.x**（`WeChat.app`），已登录 |
 | Python | 由 `uv` 自动管理（`>=3.10,<3.13`） | 同左 |
 | Dependency | `wxauto4`（uv 自动安装） | `pyobjc-framework-Cocoa / Quartz / ApplicationServices`（uv 自动安装） |
 | Permission | 无（UI Automation 不需要额外授权） | **必须**授予「辅助功能」权限给运行命令的宿主 App |
+| Input mode | wxauto4（会话校验 + 发送） | 辅助功能模式（可校验）或键盘模式（微信 4.1.x 实测走这条） |
 | Tool | [`uv`](https://docs.astral.sh/uv/) | 同左 |
 
 Linux is not supported. Linux 不支持。
 
+### macOS input modes / macOS 两种输入方式
+
+微信 Mac **4.1.x 实测不会通过辅助功能暴露聊天界面**：AX 树里只有标准菜单栏
+（Apple / 文件 / 编辑 / 显示 / 窗口 / 帮助），没有 `session_item_*`、`chat_input_field`、
+`big_title_line_h_view` 等元素，`AXEnhancedUserInterface`、`AXManualAccessibility` 与坐标
+命中测试都返回 `notImplemented`。所以 macOS 上有两条路：
+
+| 模式 | 行为 | 校验能力 |
+| --- | --- | --- |
+| **辅助功能模式**（`--input-mode ax`） | 读 AX 树切换会话、`AXRaise` 聚焦输入框、剪贴板粘贴 | 发送前校验会话标题、发送后校验消息 |
+| **键盘模式**（`--input-mode keystrokes`） | `Esc` → `Cmd+F` → 粘贴名称 → 回车 → 粘贴文件 → 回车 | **无**：发送前后都无法校验 |
+
+`--input-mode auto`（默认）会先探测 AX 内容，可用就用辅助功能模式，否则自动落到键盘模式并
+明确提示。键盘模式下目标名称必须完全正确，默认的「文件传输助手」最安全。
+
 ### macOS permission setup / macOS 权限设置
 
-macOS 的辅助功能权限是硬性要求（读取微信界面 + 合成键鼠都依赖它）：
+macOS 的辅助功能权限是硬性要求（读界面 + 合成键鼠都依赖它）：
 
 1. 打开「系统设置 → 隐私与安全性 → 辅助功能」；
-2. 勾选**运行本命令的宿主 App**（Terminal / iTerm2 / VS Code / dsh 等，不是 `python`、也不是
-   本脚本本身）；
+2. 勾选**运行本命令的宿主 App**（Terminal / iTerm2 / Ghostty / VS Code 等，不是 `python`、
+   也不是本脚本本身）；
 3. 完全退出并重新打开该 App（授权只在启动时生效）；
 4. 运行自检：`uv run scripts/send_to_filehelper.py --check`。
 
-`--check` 会输出平台、微信是否运行、权限是否授予、会话标题是否可读、会话列表与输入框是否可定位。
+`--check` 会输出平台、微信版本、权限、AX 窗口数与窗口状态、AX 探测结果、命中测试，以及最终
+判定：辅助功能模式可用，还是只能用键盘模式。加 `--debug` 可看到 AX 错误码。
 
 ## Usage / 使用方法
 
@@ -81,6 +98,9 @@ uv run scripts/send_to_filehelper.py --check
 # 发送单个文件到「文件传输助手」
 uv run scripts/send_to_filehelper.py "C:\work\报告.pdf"      # Windows
 uv run scripts/send_to_filehelper.py ~/work/报告.pdf          # macOS
+
+# macOS 若为键盘模式（--check 会告知），可显式指定：
+uv run scripts/send_to_filehelper.py ~/work/报告.pdf --input-mode keystrokes
 
 # 发送多个文件 / 通配符 / 整个目录
 uv run scripts/send_to_filehelper.py ./dist/*.zip
@@ -137,7 +157,8 @@ wx.SendFiles(r'C:\你的文件路径\报告.pdf', '文件传输助手')
 | `--retries` | `0` | 发送失败后的重试次数（**仅 Windows**，macOS 后端会忽略并提示） |
 | `--no-verify` | 关闭 | 跳过发送后的消息校验 |
 | `--dry-run` | 关闭 | 只打印待发送清单，完全不操作微信，可在任意平台执行 |
-| `--check` | 关闭 | 只做环境自检（权限 / 微信 / 窗口 / AX 元素 / 后端可用性），不发送 |
+| `--check` | 关闭 | 只做环境自检（权限 / 微信 / 窗口 / AX 元素 / 用哪种输入模式），不发送 |
+| `--input-mode` | `auto` | macOS 输入方式：`auto` 自动选择；`ax` 只用辅助功能；`keystrokes` 只用键盘（Windows 忽略） |
 | `--debug` | 关闭 | 把辅助功能（AX）调用的错误码等诊断输出到 stderr |
 | `--json` | 关闭 | 以 JSON 输出结果摘要（`platform` / `submitted` / `confirmed` / `errors`） |
 
@@ -159,7 +180,9 @@ wx.SendFiles(r'C:\你的文件路径\报告.pdf', '文件传输助手')
 
 ### macOS backend / macOS 后端（`scripts/wechat_mac.py`）
 
-使用微信 4.x 稳定的辅助功能标识：
+两条路径，`--input-mode auto` 自动选择：
+
+**辅助功能模式**（微信暴露内容时可用）使用这些标识：
 
 | 标识 | 元素 |
 | --- | --- |
@@ -168,28 +191,30 @@ wx.SendFiles(r'C:\你的文件路径\报告.pdf', '文件传输助手')
 | `chat_message_list` / `chat_bubble_item_view` | 消息列表 / 单条消息气泡 |
 | `session_item_<名称>` | 左侧会话列表中的一行 |
 
-流程：
-
 1. 用 `NSRunningApplication` 找到微信（bundle id `com.tencent.xinWeChat`）并激活到前台；
 2. 若当前会话已是目标（读 `big_title_line_h_view` 校验）→ 直接进入发送；
 3. 否则：聚焦搜索框 → 粘贴目标名 → 回车；再读会话标题校验；
 4. 校验失败则回退：在左侧会话列表找同名行并在窗口内点击，再次校验；
 5. 仍失败 → **中止**（不发送），并输出候选会话名；
-6. 把文件写入系统剪贴板（`NSPasteboard` 的 `public.file-url`，等价于访达拷贝），
-   用 `AXRaise` 聚焦输入框 → `Cmd+V` → 回车；
-7. 发送前后对比消息列表内容，做发送后校验。
+6. 文件写入 `NSPasteboard`（`public.file-url`，等价访达拷贝）→ `AXRaise` 聚焦输入框 →
+   `Cmd+V` → 回车；
+7. 发送前后对比消息列表内容做校验。
 
-macOS 端的两点差异：好友身份无法像 Windows 那样二次确认，因此发送前只认「会话标题精确匹配」
-（`--exact` 默认开启）；`--retries` 不适用。
+**键盘模式**（微信 4.1.x 实测路径）：`Esc` → `Cmd+F` → `Cmd+V` 粘贴目标名 → 回车 →
+`Cmd+V` 粘贴文件 → 回车。只依赖「辅助功能」权限发送合成键鼠事件，不依赖任何 AX 标识；
+代价是**无法校验**，因此会打印醒目提示，且 `verify_note` 会写明"不做校验"（退出码仍为 0，
+但结果里能看到）。
+
+macOS 端的两点差异：好友身份无法像 Windows 那样二次确认；`--retries` 不适用。
 
 ### Exit codes / 退出码
 
 | 退出码 | 含义 |
 | --- | --- |
-| `0` | 文件已提交，且消息校验通过（或用户用 `--no-verify` 主动跳过校验；或校验不可用但有明确提示） |
+| `0` | 文件已提交，且消息校验通过（或用户用 `--no-verify` 跳过；或键盘模式/校验不可用但已明确提示） |
 | `1` | 文件不存在 / 平台不支持 / 权限不足 / 微信不可用 / 会话不匹配 / 发送失败 / 校验未发现文件消息 |
 
-自检模式 `--check` 也使用同样的退出码：`0` 表示后端起作用，`1` 表示有问题并给出修复建议。
+自检模式 `--check`：`0` 表示后端可用（辅助功能模式或键盘模式），`1` 表示有问题并给出修复建议。
 
 ## Example Output / 示例输出
 
@@ -214,12 +239,13 @@ macOS 端的两点差异：好友身份无法像 Windows 那样二次确认，�
 | 现象 | 处理方式 |
 | --- | --- |
 | macOS 报「需要授予辅助功能权限」 | 系统设置 → 隐私与安全性 → 辅助功能 → 勾选宿主 App → 完全退出并重开 → `--check` |
-| macOS `AX 窗口数: 0` | 微信主窗口被关闭（只留在 Dock/菜单栏）：点 Dock 图标打开主窗口；发送时脚本会自动 `open -b com.tencent.xinWeChat` 尝试重开 |
-| macOS 窗口在但读不到会话标题/输入框 | 先看 `--check` 打印的 AX 树片段：若完全没有 `session_item_*` / `chat_input_field`，说明该微信版本标识不同；带上 `--debug` 的输出反馈给维护者 |
+| macOS `--check` 提示「键盘模式」 | 正常现象：微信 4.1.x 不暴露聊天界面给辅助功能。发送会自动走 `Cmd+F` + 剪贴板，无需额外操作；注意此模式**不做校验**，目标名要写对 |
+| macOS `AX 窗口数: 0` | 微信主窗口没打开（只留在 Dock/菜单栏）：点 Dock 图标打开主窗口；发送时脚本会自动 `open -b com.tencent.xinWeChat`（可用 `SEND_TO_FILEHELPER_NO_REOPEN=1` 关闭） |
 | macOS 窗口 `minimized=True` | 主窗口被最小化，脚本会激活微信但不会自动还原；先手动展开窗口 |
+| macOS 辅助功能模式下会话标题读得到、但发送失败 | 用 `--debug` 看 AX 错误码（`cannotComplete` 多为微信界面正忙），稍后重试 |
 | 非 Windows/macOS 平台 | 不支持；可在这些平台上用 `--dry-run` 仅确认清单 |
 | Windows `无法连接微信 PC 客户端` | 启动并登录微信 4.x；主窗口不要最小化到托盘；确认微信版本与 wxauto4 兼容 |
-| `当前会话是「X」，与目标「Y」不一致` | 名称不精确；用输出的候选列表修正 `--to`（macOS 也可用 `--no-exact` 放宽） |
+| `当前会话是「X」，与目标「Y」不一致` | 名称不精确；用输出的候选列表修正 `--to`（也可用 `--no-exact` 放宽） |
 | `发送后未在会话中发现任何文件消息` | 微信被遮挡/弹窗打断；保持窗口在前台、不要同时操作键鼠，然后重试 |
 | 微信提示文件过大 | 客户端对大文件有限制（超过 `--max-size-mb` 会提示）；改用其他传输方式 |
 | 中文乱码（Windows） | 脚本已强制 UTF-8；仍异常时在 `cmd` 执行 `chcp 65001` |
@@ -234,6 +260,9 @@ macOS 端的两点差异：好友身份无法像 Windows 那样二次确认，�
 4. **一次只跑一个自动化进程**，避免两个脚本同时操作同一个微信窗口。
 5. macOS 首条消息/切换会话依赖微信窗口在前台；脚本会自动激活微信但不会替你关闭其它弹窗。
 6. 发送成功只代表消息已提交给微信；手机端接收依赖微信自身的同步。
-7. **测试/高级环境变量**：`SEND_TO_FILEHELPER_BACKEND=windows|macos` 可强制后端，
+7. macOS 键盘模式（微信 4.1.x 默认路径）**没有任何校验**：`Esc` → `Cmd+F` → 粘贴名称 → 回车，
+   如果名称在微信里查不到，微信不会打开会话，随后粘贴的文件会发给**当前已打开的那个会话**。
+   因此键盘模式下务必核对 `--to`，或直接用默认的「文件传输助手」。
+8. **测试/高级环境变量**：`SEND_TO_FILEHELPER_BACKEND=windows|macos` 可强制后端，
    `SEND_TO_FILEHELPER_SKIP_PLATFORM_CHECK=1` 可忽略平台检查（仅用于模拟/开发验证），
    `SEND_TO_FILEHELPER_NO_REOPEN=1` 可禁止脚本自动 `open -b` 重开微信主窗口。
