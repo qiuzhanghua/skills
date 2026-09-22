@@ -738,6 +738,13 @@ class MacWeChat:
             return current == wanted
         return wanted in current
 
+    def matches_target(
+        self, target: str, exact: bool = True
+    ) -> Tuple[bool, Optional[str]]:
+        """当前会话是否就是目标（--no-switch 时用来做发送前校验）。"""
+        current = self.current_chat()
+        return self._name_matches(current, normalize_chat_name(target), exact), current
+
     # -- 输入框 / 剪贴板 -------------------------------------------------- #
     def _input_field(self) -> Any:
         def is_input(el: Any, role: Any, title: Any, identifier: Any) -> bool:
@@ -787,19 +794,23 @@ class MacWeChat:
         _keyboard(ESC_KEYCODE)
         time.sleep(0.2)
         _keyboard(F_KEYCODE, command=True)
-        time.sleep(0.5)
+        time.sleep(0.4)
 
-    def open_chat_by_keys(self, target: str) -> None:
+    def open_chat_by_keys(self, target: str, search_delay: float = 0.5) -> None:
         """Esc → Cmd+F → 粘贴目标名 → 回车。
 
         微信 Mac 的搜索框与输入框都能接受 Cmd+V，这条路径不依赖任何 AX
         标识，但因此也无法在发送前读取会话标题做校验。
+
+        ``search_delay`` 是粘贴名称后等待搜索结果的时间：微信会在这个搜索
+        面板里附带并列的介绍/推荐条目，等待越短它显示得越少，但太短可能
+        还没出结果，回车就落空了。
         """
         self.focus_search_by_keys()
         self.set_text_clipboard(target)
         time.sleep(0.15)
         _keyboard(V_KEYCODE, command=True)
-        time.sleep(0.7)
+        time.sleep(max(search_delay, 0.1))
         _keyboard(RETURN_KEYCODE)
         time.sleep(0.9)
 

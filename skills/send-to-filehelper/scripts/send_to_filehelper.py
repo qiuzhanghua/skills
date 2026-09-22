@@ -359,11 +359,15 @@ def switch_to(wx, target: str, exact: bool) -> Dict[str, str]:
     except Exception as exc:
         raise RuntimeError(f"切换会话失败: {target} ({exc})") from exc
 
+    return read_chat_info(wx)
+
+
+def read_chat_info(wx) -> Dict[str, str]:
+    """读取当前会话信息（不切换）。"""
     try:
-        chat_info = wx.ChatInfo() or {}
+        return dict(wx.ChatInfo() or {})
     except Exception as exc:
         raise RuntimeError(f"读取当前会话信息失败: {exc}") from exc
-    return dict(chat_info)
 
 
 def chat_matches(chat_name: str, target: str, exact: bool) -> bool:
@@ -513,11 +517,12 @@ def run_windows_backend(
     no_verify: bool,
     texts: Sequence[str] = (),
     after_texts: Sequence[str] = (),
+    switch: bool = True,
 ) -> Report:
     report = Report()
     try:
         wx = open_wechat()
-        chat_info = switch_to(wx, target, exact)
+        chat_info = switch_to(wx, target, exact) if switch else read_chat_info(wx)
     except RuntimeError as exc:
         report.abort = str(exc)
         return report
@@ -529,7 +534,10 @@ def run_windows_backend(
         return report
 
     report.target = chat_name
-    ok(f"已切换到会话: {chat_name}")
+    if switch:
+        ok(f"已切换到会话: {chat_name}")
+    else:
+        ok(f"--no-switch：使用当前会话: {chat_name}")
 
     def send_one_text(text: str, position: str) -> bool:
         try:
@@ -608,6 +616,8 @@ def run_macos_backend(
     input_mode: str = "auto",
     texts: Sequence[str] = (),
     after_texts: Sequence[str] = (),
+    switch: bool = True,
+    search_delay: float = 0.5,
 ) -> Report:
     from wechat_mac import MacBackendError, MacWeChat
 
@@ -643,14 +653,22 @@ def run_macos_backend(
             )
 
     if use_keys:
-        warn(
-            f"键盘模式不做会话/消息校验，直接发送给「{target}」——请确认名称正确；"
-            "详情见 --check。"
-        )
+        if switch:
+            warn(
+                f"键盘模式会打开微信搜索面板（微信自身会显示并列的介绍条目），"
+                f"且不做会话/消息校验，直接发送给「{target}」——请确认名称正确；"
+                "不想看到搜索面板就加 --no-switch。"
+            )
+        else:
+            warn(
+                f"--no-switch：不会切换会话，也不触发微信搜索面板，"
+                f"内容将直接发到当前已打开的会话，请确认它就是「{target}」。"
+            )
         report.target = target
         report.verify_note = "键盘模式（AX 树为空）不做会话/消息校验"
         try:
-            wx.open_chat_by_keys(target)
+            if switch:
+                wx.open_chat_by_keys(target, search_delay=search_delay)
             for text in texts:
                 wx.send_text_by_keys(text)
                 report.messages.append(text)
@@ -676,19 +694,31 @@ def run_macos_backend(
             report.abort = "没有任何内容发送成功"
         return report
 
-    try:
-        opened, current, candidates = wx.open_chat(target, exact=exact)
-    except MacBackendError as exc:
-        report.abort = str(exc)
-        return report
-    report.candidates = candidates
-
-    if not opened:
-        report.abort = f"未能切换到会话「{target}」（当前会话：「{current or '未知'}」），已取消发送。"
-        return report
+    if switch:
+        try:
+            opened, current, candidates = wx.open_chat(target, exact=exact)
+        except MacBackendError as exc:
+            report.abort = str(exc)
+            return report
+        report.candidates = candidates
+        if not opened:
+            report.abort = f"未能切换到会话「{target}」（当前会话：「{current or '未知'}」），已取消发送。"
+            return report
+    else:
+        # 不切换，但仍然读当前会话标题做校验（AX 模式可读）
+        matched, current = wx.matches_target(target, exact=exact)
+        if not matched:
+            report.abort = (
+                f"--no-switch：当前会话是「{current or '未知'}」，与目标「{target}」不一致，"
+                "已取消发送。"
+            )
+            return report
 
     report.target = current or target
-    ok(f"已切换到会话: {report.target}")
+    if switch:
+        ok(f"已切换到会话: {report.target}")
+    else:
+        ok(f"--no-switch：使用当前会话: {report.target}")
 
     before: Optional[List[str]] = None
     if not no_verify:
@@ -926,6 +956,20 @@ def check_environment(debug: bool = False) -> int:
     help="文件发送完之后再发的文本消息（可重复）。",
 )
 @click.option(
+    "--no-switch",
+    "no_switch",
+    is_flag=True,
+    default=False,
+    help="不切换会话，直接发送到当前已打开的会话（可避免微信搜索面板弹出）。",
+)
+@click.option(
+    "--search-delay",
+    type=float,
+    default=0.5,
+    show_default=True,
+    help="macOS 键盘模式：粘贴目标名后等待搜索结果再回车的秒数。",
+)
+@click.option(
     "--one-by-one",
     is_flag=True,
     default=False,
@@ -1003,6 +1047,8 @@ def main(
     exact: bool,
     messages: Tuple[str, ...],
     after_messages: Tuple[str, ...],
+    no_switch: bool,
+    search_delay: float,
     one_by_one: bool,
     delay: float,
     recursive: bool,
@@ -1103,6 +1149,8 @@ def main(
             input_mode=input_mode,
             texts=texts,
             after_texts=after_texts,
+            switch=not no_switch,
+            search_delay=search_delay,
         )
     else:
         report = run_windows_backend(
@@ -1116,6 +1164,7 @@ def main(
             no_verify,
             texts=texts,
             after_texts=after_texts,
+            switch=not no_switch,
         )
 
     if report.abort:

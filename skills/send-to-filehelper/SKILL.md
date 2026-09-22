@@ -106,6 +106,9 @@ uv run scripts/send_to_filehelper.py ~/work/报告.pdf          # macOS
 uv run scripts/send_to_filehelper.py -m "构建已完成：https://ci.example.com/1234"
 uv run scripts/send_to_filehelper.py -m "第一行" -m "第二行"        # 多条，按顺序
 
+# 不切换会话、不弹搜索面板（先手动打开目标会话）
+uv run scripts/send_to_filehelper.py ./out -m "说明" --no-switch
+
 # 先发说明文字，再发文件，最后补一句
 uv run scripts/send_to_filehelper.py ./build/app.exe -m "最新构建产物" -A "发布完成"
 
@@ -169,6 +172,8 @@ wx.SendFiles(r'C:\你的文件路径\报告.pdf', '文件传输助手')
 | `--exact / --no-exact` | `--exact` | 是否精确匹配会话名，默认开启，避免发错人 |
 | `-m, --message TEXT` | 无 | 要发送的文本消息，**可重复**，按给出顺序在文件**之前**发送 |
 | `-A, --after-message TEXT` | 无 | 文件发送完之后再发的文本消息，可重复 |
+| `--no-switch` | 关闭 | 不切换会话，直接发给当前已打开的会话；**完全不触发微信搜索面板** |
+| `--search-delay` | `0.5` | macOS 键盘模式：粘贴目标名后等搜索结果再回车的秒数（越小搜索面板显示越短） |
 | `--one-by-one` | 关闭 | 逐个文件发送；默认一次性提交多个文件 |
 | `--delay` | `1.0` | 消息/批次之间的等待秒数 |
 | `-r, --recursive` | 关闭 | 输入是目录时递归收集子目录中的文件 |
@@ -252,6 +257,18 @@ https://wxauto.org/purchase
 代价是**无法校验**，因此会打印醒目提示，且 `verify_note` 会写明"不做校验"（退出码仍为 0，
 但结果里能看到）。
 
+**搜索面板无法从脚本侧屏蔽**：`Cmd+F` 后微信会弹出自己的搜索结果面板，其中包含「文件传输助手」
+以及并列的介绍/推荐条目（看起来像广告）。这是微信客户端的行为，脚本改不了。要完全不出现它：
+
+1. 手动打开「文件传输助手」（或任何目标会话），然后加 `--no-switch`：
+   ```bash
+   uv run scripts/send_to_filehelper.py ./out -m "说明" --no-switch
+   ```
+   脚本不切换会话、不按 `Cmd+F`，直接粘贴发送，全程没有任何搜索面板。AX 模式下仍然会读
+   `big_title_line_h_view` 校验当前会话是否为目标；键盘模式下无法校验，会明确提示。
+2. 或者调小 `--search-delay`（例如 `0.2`），让搜索面板显示的时间尽量短（太小可能搜索还没出结果，
+   回车落空）。
+
 macOS 端的两点差异：好友身份无法像 Windows 那样二次确认；`--retries` 不适用。
 
 ### Exit codes / 退出码
@@ -299,6 +316,7 @@ macOS 端的两点差异：好友身份无法像 Windows 那样二次确认；`-
 | `当前会话是「X」，与目标「Y」不一致` | 名称不精确；用输出的候选列表修正 `--to`（也可用 `--no-exact` 放宽） |
 | `发送后未在会话中发现任何文件消息` | 微信被遮挡/弹窗打断；保持窗口在前台、不要同时操作键鼠，然后重试 |
 | 微信提示文件过大 | 客户端对大文件有限制（超过 `--max-size-mb` 会提示）；改用其他传输方式 |
+| 每次调用弹出微信搜索面板（含「文件传输助手」并列的介绍/推荐条目） | 这是微信客户端自己的搜索界面，脚本无法屏蔽。先手动打开目标会话，再用 `--no-switch` 发送即可完全不触发；也可用 `--search-delay 0.2` 缩短它显示的时间 |
 | 每次调用出现 `当前为免费版wxauto4 / 如需更多功能可查看plus版本 / https://wxauto.org/purchase` | 这是 wxauto4 免费版自带的推广输出。本 skill 默认已过滤并关闭其广告/遥测接口；若仍出现，说明是别的东西打印的，请把原样输出发出来 |
 | 想要更少的输出 | 加 `-q/--quiet`，成功时只打印一行 `完成: …` |
 | 中文乱码（Windows） | 脚本已强制 UTF-8；仍异常时在 `cmd` 执行 `chcp 65001` |
