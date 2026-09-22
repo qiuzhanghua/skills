@@ -102,43 +102,35 @@ uv run scripts/send_to_filehelper.py --check
 uv run scripts/send_to_filehelper.py "C:\work\报告.pdf"      # Windows
 uv run scripts/send_to_filehelper.py ~/work/报告.pdf          # macOS
 
-# 只发文字（不传文件）
-uv run scripts/send_to_filehelper.py -m "构建已完成：https://ci.example.com/1234"
-uv run scripts/send_to_filehelper.py -m "第一行" -m "第二行"        # 多条，按顺序
-
-# 不切换会话、不弹搜索面板（先手动打开目标会话）
-uv run scripts/send_to_filehelper.py ./out -m "说明" --no-switch
-
-# 先发说明文字，再发文件，最后补一句
-uv run scripts/send_to_filehelper.py ./build/app.exe -m "最新构建产物" -A "发布完成"
-
-# macOS 若为键盘模式（--check 会告知），可显式指定：
-uv run scripts/send_to_filehelper.py ~/work/报告.pdf --input-mode keystrokes
-
-# 发送多个文件 / 通配符 / 整个目录
+# 多个文件 / 通配符 / 整个目录
 uv run scripts/send_to_filehelper.py ./dist/*.zip
 uv run scripts/send_to_filehelper.py ./out --recursive
 
-# 先发一条文字说明，再发文件
-uv run scripts/send_to_filehelper.py ./build/app.exe --message "最新构建产物"
+# 只发文字（可多条，按顺序）
+uv run scripts/send_to_filehelper.py -m "构建已完成：https://ci.example.com/1234"
+uv run scripts/send_to_filehelper.py -m "第一行" -m "第二行"
 
-# 只发文字 / 先文字后文件 / 文件后再补文字
-uv run scripts/send_to_filehelper.py -m "把这段链接发到我微信：https://example.com/x"
-uv run scripts/send_to_filehelper.py -m "说明" ./report.xlsx
-uv run scripts/send_to_filehelper.py ./report.xlsx -A "查收，有问题找我"
+# 先发文字说明 → 发文件 → 再补一句
+uv run scripts/send_to_filehelper.py ./build/app.exe -m "最新构建产物" -A "发布完成"
 
-# 发送给指定好友或群聊（发送前请与用户确认名称）
-uv run scripts/send_to_filehelper.py ./report.xlsx --to "张三"
+# 不切换会话、不弹微信搜索面板（先手动打开目标会话）
+uv run scripts/send_to_filehelper.py ./out -m "说明" --no-switch
+
+# 发给指定好友或群聊（发送前请与用户确认名称）
+uv run scripts/send_to_filehelper.py ./report.xlsx -m "说明" --to "张三"
+
+# macOS 键盘模式可显式指定（--check 会告知当前是哪种模式）
+uv run scripts/send_to_filehelper.py ~/work/报告.pdf --input-mode keystrokes
 
 # 只检查将要发送什么，不操作微信（可在任意平台运行）
 uv run scripts/send_to_filehelper.py ./out --dry-run
 
-# 机器可读的结果摘要
+# 机器可读的结果摘要 / 安静模式（成功时只输出一行）
 uv run scripts/send_to_filehelper.py ./out --json
-
-# 安静模式：只输出一行结果，适合脚本/定时任务
 uv run scripts/send_to_filehelper.py ./out -q
 ```
+
+`-m/--message` 可重复，`-A/--after-message` 同理；长选项写法与短选项等价。
 
 ### Minimal examples / 最简示例
 
