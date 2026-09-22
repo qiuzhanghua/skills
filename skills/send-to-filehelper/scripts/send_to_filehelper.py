@@ -56,6 +56,7 @@ class Report:
 
     target: str = ""
     submitted: List[Path] = field(default_factory=list)
+    messages: List[str] = field(default_factory=list)
     confirmed: List[str] = field(default_factory=list)
     unconfirmed: List[str] = field(default_factory=list)
     verify_note: Optional[str] = None
@@ -348,31 +349,54 @@ def send_batches(
 
 
 def verify_sent(
-    wx, files: Sequence[Path]
+    wx, files: Sequence[Path], texts: Sequence[str] = ()
 ) -> Tuple[List[str], List[str], Optional[str]]:
-    """读取当前会话消息，尽力确认文件消息已出现。
+    """读取当前会话消息，尽力确认文件/文本消息已出现。
 
     Returns:
-        (confirmed, missing, note): 已确认的文件名、未确认的文件名、不可用原因
+        (confirmed, missing, note): 已确认项、未确认项、不可用原因。
+        条目既可能是文件名，也可能是 ``文本: 摘要``。
     """
     try:
         messages = wx.GetAllMessage() or []
     except Exception as exc:
-        return [], [path.name for path in files], f"无法读取会话消息: {exc}"
+        return [], _expected_labels(files, texts), f"无法读取会话消息: {exc}"
 
-    haystack: List[str] = []
+    file_haystack: List[str] = []
+    text_haystack: List[str] = []
     for message in messages:
-        if getattr(message, "type", "") != "file":
-            continue
-        haystack.append(str(getattr(message, "content", "") or ""))
+        kind = getattr(message, "type", "")
+        content = str(getattr(message, "content", "") or "")
+        if kind == "file":
+            file_haystack.append(content)
+        elif kind == "text":
+            text_haystack.append(content)
 
     confirmed: List[str] = []
     missing: List[str] = []
     for path in files:
         stem = path.stem
-        hit = any(path.name in text or (stem and stem in text) for text in haystack)
+        hit = any(
+            path.name in text or (stem and stem in text) for text in file_haystack
+        )
         (confirmed if hit else missing).append(path.name)
+    for text in texts:
+        needle = text.strip()
+        hit = bool(needle) and any(needle in content for content in text_haystack)
+        label = _text_label(text)
+        (confirmed if hit else missing).append(label)
     return confirmed, missing, None
+
+
+def _text_label(text: str, width: int = 20) -> str:
+    flat = " ".join(text.split())
+    if len(flat) > width:
+        flat = flat[:width] + "…"
+    return f"文本: {flat}"
+
+
+def _expected_labels(files: Sequence[Path], texts: Sequence[str]) -> List[str]:
+    return [path.name for path in files] + [_text_label(text) for text in texts]
 
 
 # --------------------------------------------------------------------------- #
@@ -387,6 +411,8 @@ def run_windows_backend(
     delay: float,
     retries: int,
     no_verify: bool,
+    texts: Sequence[str] = (),
+    after_texts: Sequence[str] = (),
 ) -> Report:
     report = Report()
     try:
@@ -405,32 +431,49 @@ def run_windows_backend(
     report.target = chat_name
     ok(f"已切换到会话: {chat_name}")
 
-    if message:
+    def send_one_text(text: str, position: str) -> bool:
         try:
-            msg_result = wx.SendMsg(message)
+            result = wx.SendMsg(text)
         except Exception as exc:
-            report.abort = f"发送文本消息失败: {exc}"
-            return report
-        msg_ok, msg_detail = describe_result(msg_result)
+            report.abort = f"发送{position}失败: {exc}"
+            return False
+        msg_ok, msg_detail = describe_result(result)
         if msg_ok is False:
-            report.abort = f"发送文本消息失败: {msg_detail}"
+            report.abort = f"发送{position}失败: {msg_detail}"
+            return False
+        report.messages.append(text)
+        info(f"已发送{position}: {text}")
+        if delay > 0:
+            time.sleep(delay)
+        return True
+
+    for text in texts:
+        if not send_one_text(text, "文本消息"):
             return report
-        info(f"已发送文本消息: {message}")
+
+    sent: List[Path] = []
+    if files:
+        sent, errors = send_batches(wx, files, one_by_one, delay, max(retries, 0))
+        report.errors = errors
+        report.submitted = sent
+        if not sent:
+            report.abort = "没有任何文件发送成功"
+            return report
         if delay > 0:
             time.sleep(delay)
 
-    sent, errors = send_batches(wx, files, one_by_one, delay, max(retries, 0))
-    report.errors = errors
-    report.submitted = sent
-    if not sent:
-        report.abort = "没有任何文件发送成功"
+    for text in after_texts:
+        if not send_one_text(text, "文本消息（文件之后）"):
+            return report
+
+    if not sent and not report.messages:
+        report.abort = "没有任何内容发送成功"
         return report
 
-    if delay > 0:
-        time.sleep(delay)
-
     if not no_verify:
-        report.confirmed, report.unconfirmed, report.verify_note = verify_sent(wx, sent)
+        report.confirmed, report.unconfirmed, report.verify_note = verify_sent(
+            wx, sent, [*texts, *after_texts]
+        )
     return report
 
 
@@ -438,7 +481,7 @@ def run_windows_backend(
 # 平台后端：macOS（Accessibility API）
 # --------------------------------------------------------------------------- #
 def _match_by_filename(
-    texts: Sequence[str], files: Sequence[Path]
+    texts: Sequence[str], files: Sequence[Path], messages: Sequence[str] = ()
 ) -> Tuple[List[str], List[str]]:
     confirmed: List[str] = []
     missing: List[str] = []
@@ -446,6 +489,10 @@ def _match_by_filename(
         stem = path.stem
         hit = any(path.name in text or (stem and stem in text) for text in texts)
         (confirmed if hit else missing).append(path.name)
+    for text in messages:
+        needle = text.strip()
+        hit = bool(needle) and any(needle in content for content in texts)
+        (confirmed if hit else missing).append(_text_label(text))
     return confirmed, missing
 
 
@@ -459,6 +506,8 @@ def run_macos_backend(
     retries: int,
     no_verify: bool,
     input_mode: str = "auto",
+    texts: Sequence[str] = (),
+    after_texts: Sequence[str] = (),
 ) -> Report:
     from wechat_mac import MacBackendError, MacWeChat
 
@@ -495,26 +544,36 @@ def run_macos_backend(
 
     if use_keys:
         warn(
-            f"键盘模式无法在发送前校验会话、也无法在发送后校验消息，"
+            "键盘模式无法在发送前校验会话、也无法在发送后校验消息，"
             f"即将直接发送给「{target}」——请确认这个名称在微信里完全正确。"
         )
         report.target = target
         report.verify_note = "键盘模式（AX 树为空）不做会话/消息校验"
         try:
             wx.open_chat_by_keys(target)
-            if message:
-                wx.send_text_by_keys(message)
-                info(f"已发送文本消息: {message}")
+            for text in texts:
+                wx.send_text_by_keys(text)
+                report.messages.append(text)
+                info(f"已发送文本消息: {text}")
                 if delay > 0:
                     time.sleep(delay)
-            info(f"粘贴文件并发送: {'、'.join(path.name for path in files)}")
-            wx.send_files_by_keys(
-                [str(path) for path in files], batch=not one_by_one, interval=delay
-            )
+            if files:
+                info(f"粘贴文件并发送: {'、'.join(path.name for path in files)}")
+                wx.send_files_by_keys(
+                    [str(path) for path in files], batch=not one_by_one, interval=delay
+                )
+                report.submitted = list(files)
+            for text in after_texts:
+                wx.send_text_by_keys(text)
+                report.messages.append(text)
+                info(f"已发送文本消息（文件之后）: {text}")
+                if delay > 0:
+                    time.sleep(delay)
         except MacBackendError as exc:
             report.abort = str(exc)
             return report
-        report.submitted = list(files)
+        if not report.submitted and not report.messages:
+            report.abort = "没有任何内容发送成功"
         return report
 
     try:
@@ -539,21 +598,33 @@ def run_macos_backend(
             before = None
 
     try:
-        if message:
-            wx.send_text(message)
-            info(f"已发送文本消息: {message}")
+        for text in texts:
+            wx.send_text(text)
+            report.messages.append(text)
+            info(f"已发送文本消息: {text}")
             if delay > 0:
                 time.sleep(delay)
 
-        info(f"粘贴文件并发送: {'、'.join(path.name for path in files)}")
-        wx.send_files(
-            [str(path) for path in files], batch=not one_by_one, interval=delay
-        )
+        if files:
+            info(f"粘贴文件并发送: {'、'.join(path.name for path in files)}")
+            wx.send_files(
+                [str(path) for path in files], batch=not one_by_one, interval=delay
+            )
+            report.submitted = list(files)
+
+        for text in after_texts:
+            wx.send_text(text)
+            report.messages.append(text)
+            info(f"已发送文本消息（文件之后）: {text}")
+            if delay > 0:
+                time.sleep(delay)
     except MacBackendError as exc:
         report.abort = str(exc)
         return report
 
-    report.submitted = list(files)
+    if not report.submitted and not report.messages:
+        report.abort = "没有任何内容发送成功"
+        return report
 
     if no_verify:
         return report
@@ -570,7 +641,7 @@ def run_macos_backend(
         )
         return report
 
-    confirmed, missing = _match_by_filename(after, files)
+    confirmed, missing = _match_by_filename(after, files, [*texts, *after_texts])
     if not confirmed and before is not None and len(after) > len(before):
         # 没有匹配到文件名，但确实多出了新消息 —— 大概率已发送成功
         report.confirmed = [path.name for path in files]
@@ -740,7 +811,20 @@ def check_environment(debug: bool = False) -> int:
     show_default=True,
     help="是否精确匹配目标名称（默认开启，避免发错人）。",
 )
-@click.option("-m", "--message", default=None, help="发送文件前先发送一条文本消息。")
+@click.option(
+    "-m",
+    "--message",
+    "messages",
+    multiple=True,
+    help="要发送的文本消息（可重复，按顺序在文件之前发送）。",
+)
+@click.option(
+    "-A",
+    "--after-message",
+    "after_messages",
+    multiple=True,
+    help="文件发送完之后再发的文本消息（可重复）。",
+)
 @click.option(
     "--one-by-one",
     is_flag=True,
@@ -781,7 +865,7 @@ def check_environment(debug: bool = False) -> int:
     "--dry-run",
     is_flag=True,
     default=False,
-    help="只打印将要发送的文件，不操作微信（可在任意平台执行）。",
+    help="只打印将要发送的文本与文件，不操作微信（可在任意平台执行）。",
 )
 @click.option(
     "--check",
@@ -810,7 +894,8 @@ def main(
     files: Tuple[str, ...],
     target: str,
     exact: bool,
-    message: Optional[str],
+    messages: Tuple[str, ...],
+    after_messages: Tuple[str, ...],
     one_by_one: bool,
     delay: float,
     recursive: bool,
@@ -823,7 +908,7 @@ def main(
     debug: bool,
     as_json: bool,
 ) -> None:
-    """把本地文件发送到微信文件传输助手或指定会话（Windows / macOS）。"""
+    """把本地文件 / 文本发送到微信文件传输助手或指定会话（Windows / macOS）。"""
     enable_utf8_output()
 
     if check_only:
@@ -834,15 +919,18 @@ def main(
 
         wechat_mac.set_debug(True)
 
+    texts = [text for text in messages if text]
+    after_texts = [text for text in after_messages if text]
+
+    if not files and not texts and not after_texts:
+        fail("至少要指定一个文件，或用 -m/--message 指定要发送的文本。")
+        sys.exit(1)
+
     resolved, problems = expand_inputs(files, recursive)
     if problems:
         for item in problems:
             fail(item)
         fail("输入未能全部解析，为避免漏发已中止。")
-        sys.exit(1)
-
-    if not resolved:
-        fail("没有可发送的文件")
         sys.exit(1)
 
     total_bytes = 0
@@ -853,13 +941,24 @@ def main(
             pass
 
     info(f"目标会话: {target}（精确匹配: {'是' if exact else '否'}）")
-    info(f"待发送: {len(resolved)} 个文件，共 {human_size(total_bytes)}")
+    parts = []
+    if texts:
+        parts.append(f"{len(texts)} 条文本（文件之前）")
+    if resolved:
+        parts.append(f"{len(resolved)} 个文件，共 {human_size(total_bytes)}")
+    if after_texts:
+        parts.append(f"{len(after_texts)} 条文本（文件之后）")
+    info("待发送: " + "、".join(parts) if parts else "待发送: 无")
+    for text in texts:
+        click.echo(f"  [文本] {text}")
     for path in resolved:
         try:
             size = human_size(path.stat().st_size)
         except OSError:
             size = "?"
-        click.echo(f"  - {display_path(path)}  ({size})")
+        click.echo(f"  [文件] {display_path(path)}  ({size})")
+    for text in after_texts:
+        click.echo(f"  [文本·后] {text}")
 
     for item in check_sizes(resolved, max_size_mb):
         warn(item)
@@ -886,16 +985,27 @@ def main(
             resolved,
             target,
             exact,
-            message,
+            None,
             one_by_one,
             delay,
             retries,
             no_verify,
             input_mode=input_mode,
+            texts=texts,
+            after_texts=after_texts,
         )
     else:
         report = run_windows_backend(
-            resolved, target, exact, message, one_by_one, delay, retries, no_verify
+            resolved,
+            target,
+            exact,
+            None,
+            one_by_one,
+            delay,
+            retries,
+            no_verify,
+            texts=texts,
+            after_texts=after_texts,
         )
 
     if report.abort:
@@ -908,20 +1018,25 @@ def main(
     click.echo("")
     click.secho("=" * 52)
     info(f"目标会话 : {report.target}")
-    info(f"已提交   : {len(report.submitted)}/{len(resolved)} 个文件")
+    if resolved:
+        info(f"已提交   : {len(report.submitted)}/{len(resolved)} 个文件")
+    if texts or after_texts:
+        sent_texts = len(report.messages)
+        info(f"文本消息 : {sent_texts}/{len(texts) + len(after_texts)} 条")
     if not no_verify:
         if report.verify_note:
             warn(f"消息校验：{report.verify_note}")
         if report.unconfirmed:
             warn(f"未在会话中确认到: {'、'.join(report.unconfirmed)}")
         elif not report.verify_note:
-            ok(f"已确认全部 {len(report.confirmed)} 个文件出现在会话中")
+            ok(f"已确认全部 {len(report.confirmed)} 项内容出现在会话中")
 
     result = {
         "platform": "macos" if platform == "darwin" else "windows",
         "target": report.target,
         "requested": [str(path) for path in resolved],
         "submitted": [str(path) for path in report.submitted],
+        "messages": report.messages,
         "confirmed": report.confirmed,
         "unconfirmed": report.unconfirmed,
         "errors": report.errors,
@@ -934,7 +1049,7 @@ def main(
         sys.exit(1)
     # 会话消息里一个都没看到 → 视为失败（除非用户主动关闭校验）
     if not no_verify and not report.verify_note and not report.confirmed:
-        fail("发送后未在会话中发现任何文件消息，请检查微信窗口状态。")
+        fail("发送后未在会话中发现任何内容，请检查微信窗口状态。")
         sys.exit(1)
 
     ok("完成")
