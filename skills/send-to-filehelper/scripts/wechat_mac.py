@@ -21,7 +21,11 @@
 
 from __future__ import annotations
 
+import os
+import plistlib
 import re
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Sequence, Tuple
@@ -59,6 +63,7 @@ try:  # pragma: no cover - 依赖导入
         AXUIElementCreateApplication,
         AXUIElementPerformAction,
         AXUIElementSetAttributeValue,
+        AXUIElementSetMessagingTimeout,
         AXValueGetType,
         AXValueGetValue,
         kAXChildrenAttribute,
@@ -71,6 +76,7 @@ try:  # pragma: no cover - 依赖导入
         kAXValueAttribute,
         kAXValueCGPointType,
         kAXValueCGSizeType,
+        kAXWindowRole,
         kAXWindowsAttribute,
         kAXStaticTextRole,
         kAXTextAreaRole,
@@ -125,8 +131,62 @@ def _require_frameworks() -> None:
 # --------------------------------------------------------------------------- #
 # AX 基础操作
 # --------------------------------------------------------------------------- #
+DEBUG = False
+
+
+def set_debug(enabled: bool) -> None:
+    global DEBUG
+    DEBUG = bool(enabled)
+
+
+def _debug(message: str) -> None:
+    if not DEBUG:
+        return
+    try:
+        sys.stderr.write(f"[ax] {message}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+AX_ERROR_NAMES = {
+    0: "success",
+    -25200: "failure",
+    -25201: "illegalArgument",
+    -25202: "invalidUIElement",
+    -25203: "invalidUIElementObserver",
+    -25204: "cannotComplete",
+    -25205: "attributeUnsupported",
+    -25206: "actionUnsupported",
+    -25207: "notificationUnsupported",
+    -25208: "notImplemented",
+    -25209: "notificationAlreadyRegistered",
+    -25210: "notificationNotRegistered",
+    -25211: "apiDisabled(辅助功能未授权?)",
+    -25212: "noValue",
+    -25213: "parameterizedAttributeUnsupported",
+    -25214: "notEnoughPrecision",
+}
+
+
+def ax_error_name(err: int) -> str:
+    return AX_ERROR_NAMES.get(err, f"error {err}")
+
+
+def ax_copy(element: Any, attribute: str) -> Tuple[int, Any]:
+    """返回 (AX 错误码, 值)，便于诊断。"""
+    try:
+        err, value = AXUIElementCopyAttributeValue(element, attribute, None)
+    except Exception as exc:  # pyobjc 在元素失效时可能直接抛异常
+        _debug(f"copy {attribute} 异常: {exc}")
+        return -25202, None
+    if err != 0:
+        _debug(f"copy {attribute} -> {ax_error_name(err)}")
+    return err, value
+
+
 def ax_get(element: Any, attribute: str) -> Any:
-    err, value = AXUIElementCopyAttributeValue(element, attribute, None)
+    err, value = ax_copy(element, attribute)
     if err != 0:
         return None
     return value
@@ -236,15 +296,28 @@ class MacWeChat:
 
     @staticmethod
     def version() -> Optional[str]:
+        """优先用运行中的应用信息，取不到就读 App 包的 Info.plist。"""
         if _IMPORT_ERROR is not None:
             return None
         try:
             apps = AppKit.NSRunningApplication.runningApplicationsWithBundleIdentifier_(
                 BUNDLE_ID
             )
-            return apps[0].bundleVersion() if apps else None
-        except Exception:
-            return None
+            if apps:
+                version = apps[0].bundleVersion()
+                if version:
+                    return str(version)
+                bundle_url = apps[0].bundleURL()
+                if bundle_url is not None:
+                    plist_path = bundle_url.path() + "/Contents/Info.plist"
+                    with open(plist_path, "rb") as handle:
+                        info = plistlib.load(handle)
+                    for key in ("CFBundleShortVersionString", "CFBundleVersion"):
+                        if info.get(key):
+                            return str(info[key])
+        except Exception as exc:
+            _debug(f"读取微信版本失败: {exc}")
+        return None
 
     @property
     def ax_app(self) -> Any:
@@ -252,17 +325,111 @@ class MacWeChat:
             self._ax_app = AXUIElementCreateApplication(
                 self._ns_app.processIdentifier()
             )
+            try:
+                AXUIElementSetMessagingTimeout(self._ax_app, 2.0)
+            except Exception as exc:  # pragma: no cover - 老系统可能不支持
+                _debug(f"设置 AX 超时失败: {exc}")
         return self._ax_app
 
     def _check_permission(self) -> None:
         if not AXIsProcessTrusted():
             raise MacPermissionError(PERMISSION_HINT)
 
-    def activate(self) -> None:
+    def activate(self, reopen_if_needed: bool = True) -> None:
         was_active = bool(self._ns_app.isActive())
         self._ns_app.activateWithOptions_(AppKit.NSApplicationActivateIgnoringOtherApps)
         if not was_active:
             time.sleep(ACTIVATE_SETTLE)
+        if reopen_if_needed and not self.windows():
+            self.reopen_main_window()
+
+    def reopen_main_window(self, timeout: float = 5.0) -> bool:
+        """微信主窗口被关闭（只留在 Dock/菜单栏）时重新打开它。"""
+        if os.environ.get("SEND_TO_FILEHELPER_NO_REOPEN"):
+            _debug("SEND_TO_FILEHELPER_NO_REOPEN 已设置，跳过自动重开微信窗口")
+            return bool(self.windows())
+        _debug("未发现 AX 窗口，尝试 open -b 重新打开微信主窗口")
+        try:
+            subprocess.run(
+                ["open", "-b", BUNDLE_ID],
+                check=False,
+                capture_output=True,
+                timeout=10,
+            )
+        except Exception as exc:
+            _debug(f"open -b {BUNDLE_ID} 失败: {exc}")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.windows():
+                time.sleep(ACTIVATE_SETTLE)
+                return True
+            time.sleep(0.25)
+        return bool(self.windows())
+
+    # -- 诊断 ------------------------------------------------------------- #
+    def window_summaries(self, limit: int = 3) -> List[str]:
+        """窗口标题/是否最小化/位置尺寸，用于诊断。"""
+        summaries: List[str] = []
+        for window in self.windows()[:limit]:
+            title = ax_get(window, kAXTitleAttribute) or "?"
+            minimized = ax_get(window, "AXMinimized")
+            point = _point_of(window)
+            size = _size_of(window)
+            summaries.append(
+                f"{title!r} minimized={bool(minimized)} pos={point} size={size}"
+            )
+        return summaries
+
+    def windows(self) -> List[Any]:
+        """当前存在的 AX 窗口（主窗口被关闭时为 0）。"""
+        err, value = ax_copy(self.ax_app, kAXWindowsAttribute)
+        candidates = list(value or []) if err == 0 else []
+        if not candidates:
+            # 某些版本/状态下 AXWindows 取不到，退回按角色扫描直接子元素
+            candidates = [
+                child
+                for child in ax_children(self.ax_app)
+                if ax_get(child, kAXRoleAttribute) == kAXWindowRole
+            ]
+        result: List[Any] = []
+        for window in candidates:
+            size = _size_of(window)
+            if size is None or (size[0] >= 80 and size[1] >= 80):
+                result.append(window)
+        return result
+
+    def try_enable_enhanced_ui(self) -> List[Tuple[str, int]]:
+        """尝试打开微信的完整辅助功能树（部分应用需要这个握手）。"""
+        results: List[Tuple[str, int]] = []
+        for attribute in ("AXEnhancedUserInterface", "AXManualAccessibility"):
+            err = AXUIElementSetAttributeValue(self.ax_app, attribute, True)
+            results.append((attribute, err))
+            _debug(f"set {attribute}=True -> {ax_error_name(err)}")
+        return results
+
+    def debug_dump(self, limit: int = 40) -> List[str]:
+        """把当前 AX 树（角色/标识/标题）打印成行，便于适配微信版本。"""
+        lines: List[str] = []
+        queue: List[Tuple[Any, int]] = [(self.ax_app, 0)]
+        while queue and len(lines) < limit:
+            element, depth = queue.pop(0)
+            role = ax_get(element, kAXRoleAttribute) or "?"
+            identifier = ax_get(element, kAXIdentifierAttribute) or ""
+            title = ax_get(element, kAXTitleAttribute) or ""
+            value = ax_get(element, kAXValueAttribute) or ""
+            summary = f"{'  ' * depth}{role}"
+            if identifier:
+                summary += f"  #{identifier}"
+            if title:
+                summary += f"  title={str(title)[:40]!r}"
+            elif value:
+                summary += f"  value={str(value)[:40]!r}"
+            lines.append(summary)
+            for child in ax_children(element):
+                queue.append((child, depth + 1))
+        if len(lines) >= limit:
+            lines.append(f"...（仅显示前 {limit} 个元素）")
+        return lines
 
     # -- 会话 ------------------------------------------------------------- #
     def current_chat(self) -> Optional[str]:
@@ -283,8 +450,7 @@ class MacWeChat:
         return None
 
     def _window_frame(self) -> Optional[Tuple[float, float, float, float]]:
-        windows = ax_get(self.ax_app, kAXWindowsAttribute) or []
-        for window in windows:
+        for window in self.windows():
             point = _point_of(window)
             size = _size_of(window)
             if point and size and size[0] > 100 and size[1] > 100:

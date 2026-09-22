@@ -546,7 +546,7 @@ def run_macos_backend(
 # --------------------------------------------------------------------------- #
 # 环境自检
 # --------------------------------------------------------------------------- #
-def check_environment() -> int:
+def check_environment(debug: bool = False) -> int:
     """检查当前平台的后端是否可用，返回退出码。"""
     platform = sys.platform
     problems: List[str] = []
@@ -575,7 +575,10 @@ def check_environment() -> int:
         return 0
 
     if platform == "darwin":
+        import wechat_mac
         from wechat_mac import MacBackendError, MacWeChat
+
+        wechat_mac.set_debug(debug)
 
         info("平台: macOS（后端: Accessibility API）")
         try:
@@ -598,33 +601,74 @@ def check_environment() -> int:
                 "然后完全退出并重开该 App。"
             )
 
-        if running and MacWeChat.permission_granted():
+        if not (running and MacWeChat.permission_granted()):
+            for item in problems:
+                fail(item)
+            return 1
+
+        try:
+            wx = MacWeChat()
+            wx.activate()
+        except MacBackendError as exc:
+            fail(str(exc))
+            return 1
+
+        windows = wx.windows()
+        info(f"AX 窗口数: {len(windows)}")
+        for summary in wx.window_summaries():
+            info(f"  - {summary}")
+        if not windows:
+            fail(
+                "微信主窗口没有打开：AX 树里没有任何窗口。\n"
+                "  处理：点一下 Dock 栏里的微信图标（或菜单栏微信 → 打开微信），"
+                "让主窗口显示出来后再运行 --check。"
+            )
+            return 1
+
+        def probe() -> Tuple[Optional[str], int, bool]:
+            current = wx.current_chat()
+            rows = wx.sidebar_rows()
             try:
-                wx = MacWeChat()
-                wx.activate()
-                current = wx.current_chat()
-                if current:
-                    ok(f"会话标题可读，当前会话: {current}")
-                else:
-                    problems.append(
-                        "无法读取会话标题（big_title_line_h_view），"
-                        "请确认微信主窗口已打开且未最小化。"
-                    )
-                rows = wx.sidebar_rows()
-                info(f"会话列表可见行数: {len(rows)}")
-                if rows:
-                    info("会话示例: " + "、".join(row.name for row in rows[:5]))
                 wx.focus_input()
-                ok("聊天输入框可定位（chat_input_field）")
-            except MacBackendError as exc:
-                problems.append(str(exc))
-            except Exception as exc:
-                problems.append(f"读取微信界面失败: {exc}")
+                input_ok = True
+            except MacBackendError:
+                input_ok = False
+            return current, len(rows), input_ok
+
+        current, row_count, input_ok = probe()
+        if not current or row_count == 0 or not input_ok:
+            info("首次读取不完整，尝试启用微信完整辅助功能树后重试...")
+            wx.try_enable_enhanced_ui()
+            time.sleep(0.5)
+            current, row_count, input_ok = probe()
+
+        if current:
+            ok(f"会话标题可读，当前会话: {current}")
+        else:
+            problems.append(
+                "无法读取会话标题（big_title_line_h_view / big_line_h_view）。"
+            )
+        info(f"会话列表可见行数: {row_count}")
+        if row_count:
+            info("会话示例: " + "、".join(row.name for row in wx.sidebar_rows()[:5]))
+        if input_ok:
+            ok("聊天输入框可定位（chat_input_field）")
+        else:
+            problems.append("未能定位聊天输入框（chat_input_field）。")
 
         if problems:
             for item in problems:
                 fail(item)
+            click.echo("")
+            info("当前 AX 树片段（角色 / 标识 / 标题），可用于适配你的微信版本：")
+            for line in wx.debug_dump(limit=40):
+                click.echo("  " + line)
+            info(
+                "若窗口数为 1 但仍找不到会话/输入框元素，说明该微信版本未暴露这些标识；"
+                "请把上面的片段反馈给 skill 维护者（或用 --debug 查看 AX 错误码）。"
+            )
             return 1
+
         ok("macOS 后端自检通过")
         return 0
 
@@ -702,6 +746,12 @@ def check_environment() -> int:
     help="只做环境自检（权限/微信/后端可用性）。",
 )
 @click.option(
+    "--debug",
+    is_flag=True,
+    default=False,
+    help="把辅助功能（AX）调用诊断输出到 stderr。",
+)
+@click.option(
     "--json", "as_json", is_flag=True, default=False, help="以 JSON 输出结果摘要。"
 )
 def main(
@@ -717,13 +767,19 @@ def main(
     no_verify: bool,
     dry_run: bool,
     check_only: bool,
+    debug: bool,
     as_json: bool,
 ) -> None:
     """把本地文件发送到微信文件传输助手或指定会话（Windows / macOS）。"""
     enable_utf8_output()
 
     if check_only:
-        sys.exit(check_environment())
+        sys.exit(check_environment(debug=debug))
+
+    if debug and sys.platform == "darwin":
+        import wechat_mac
+
+        wechat_mac.set_debug(True)
 
     resolved, problems = expand_inputs(files, recursive)
     if problems:

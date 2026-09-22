@@ -137,7 +137,8 @@ wx.SendFiles(r'C:\你的文件路径\报告.pdf', '文件传输助手')
 | `--retries` | `0` | 发送失败后的重试次数（**仅 Windows**，macOS 后端会忽略并提示） |
 | `--no-verify` | 关闭 | 跳过发送后的消息校验 |
 | `--dry-run` | 关闭 | 只打印待发送清单，完全不操作微信，可在任意平台执行 |
-| `--check` | 关闭 | 只做环境自检（权限 / 微信 / 后端可用性），不发送 |
+| `--check` | 关闭 | 只做环境自检（权限 / 微信 / 窗口 / AX 元素 / 后端可用性），不发送 |
+| `--debug` | 关闭 | 把辅助功能（AX）调用的错误码等诊断输出到 stderr |
 | `--json` | 关闭 | 以 JSON 输出结果摘要（`platform` / `submitted` / `confirmed` / `errors`） |
 
 ## Technical Implementation / 技术实现
@@ -213,7 +214,9 @@ macOS 端的两点差异：好友身份无法像 Windows 那样二次确认，�
 | 现象 | 处理方式 |
 | --- | --- |
 | macOS 报「需要授予辅助功能权限」 | 系统设置 → 隐私与安全性 → 辅助功能 → 勾选宿主 App → 完全退出并重开 → `--check` |
-| macOS 会话标题读不到 | 微信主窗口被最小化/遮挡，先切到前台；`--check` 会检查这一项 |
+| macOS `AX 窗口数: 0` | 微信主窗口被关闭（只留在 Dock/菜单栏）：点 Dock 图标打开主窗口；发送时脚本会自动 `open -b com.tencent.xinWeChat` 尝试重开 |
+| macOS 窗口在但读不到会话标题/输入框 | 先看 `--check` 打印的 AX 树片段：若完全没有 `session_item_*` / `chat_input_field`，说明该微信版本标识不同；带上 `--debug` 的输出反馈给维护者 |
+| macOS 窗口 `minimized=True` | 主窗口被最小化，脚本会激活微信但不会自动还原；先手动展开窗口 |
 | 非 Windows/macOS 平台 | 不支持；可在这些平台上用 `--dry-run` 仅确认清单 |
 | Windows `无法连接微信 PC 客户端` | 启动并登录微信 4.x；主窗口不要最小化到托盘；确认微信版本与 wxauto4 兼容 |
 | `当前会话是「X」，与目标「Y」不一致` | 名称不精确；用输出的候选列表修正 `--to`（macOS 也可用 `--no-exact` 放宽） |
@@ -231,5 +234,6 @@ macOS 端的两点差异：好友身份无法像 Windows 那样二次确认，�
 4. **一次只跑一个自动化进程**，避免两个脚本同时操作同一个微信窗口。
 5. macOS 首条消息/切换会话依赖微信窗口在前台；脚本会自动激活微信但不会替你关闭其它弹窗。
 6. 发送成功只代表消息已提交给微信；手机端接收依赖微信自身的同步。
-7. **测试用环境变量**（一般不需要）：`SEND_TO_FILEHELPER_BACKEND=windows|macos` 可强制后端，
-   `SEND_TO_FILEHELPER_SKIP_PLATFORM_CHECK=1` 可忽略平台检查 —— 仅用于模拟/开发验证。
+7. **测试/高级环境变量**：`SEND_TO_FILEHELPER_BACKEND=windows|macos` 可强制后端，
+   `SEND_TO_FILEHELPER_SKIP_PLATFORM_CHECK=1` 可忽略平台检查（仅用于模拟/开发验证），
+   `SEND_TO_FILEHELPER_NO_REOPEN=1` 可禁止脚本自动 `open -b` 重开微信主窗口。
