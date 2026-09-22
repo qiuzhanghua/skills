@@ -132,6 +132,9 @@ uv run scripts/send_to_filehelper.py ./out --dry-run
 
 # 机器可读的结果摘要
 uv run scripts/send_to_filehelper.py ./out --json
+
+# 安静模式：只输出一行结果，适合脚本/定时任务
+uv run scripts/send_to_filehelper.py ./out -q
 ```
 
 ### Minimal examples / 最简示例
@@ -175,6 +178,7 @@ wx.SendFiles(r'C:\你的文件路径\报告.pdf', '文件传输助手')
 | `--dry-run` | 关闭 | 只打印待发送的文本与文件，完全不操作微信，可在任意平台执行 |
 | `--check` | 关闭 | 只做环境自检（权限 / 微信 / 窗口 / AX 元素 / 用哪种输入模式），不发送 |
 | `--input-mode` | `auto` | macOS 输入方式：`auto` 自动选择；`ax` 只用辅助功能；`keystrokes` 只用键盘（Windows 忽略） |
+| `-q, --quiet` | 关闭 | 安静模式：只输出警告/错误和一行结果（适合脚本/定时任务） |
 | `--debug` | 关闭 | 把辅助功能（AX）调用的错误码等诊断输出到 stderr |
 | `--json` | 关闭 | 以 JSON 输出结果摘要（`submitted` / `messages` / `confirmed` / `errors`） |
 
@@ -198,6 +202,27 @@ wx.SendFiles(r'C:\你的文件路径\报告.pdf', '文件传输助手')
 5. 文件用 `wx.SendFiles([...绝对路径...])`（已确认会话正确，故不重复传 `who`）；
 6. `wx.GetAllMessage()` 里按消息类型校验：`type == 'file'` 匹配文件名，`type == 'text'`
    匹配文本内容；`SendFiles`/`SendMsg` 的返回值两种形态都兼容。
+
+#### 关于 wxauto4 免费版的推广输出 / silencing the free-version banner
+
+`wxauto4` 免费版在构造客户端时会打印：
+
+```
+当前为免费版wxauto4
+如需更多功能可查看plus版本
+https://wxauto.org/purchase
+```
+
+而且 `wxauto4.param.WxParam` 里带着远程广告与遥测开关（`AD_API_URL`、`REPORT_API_URL`、
+`TELEMETRY_ENABLED=True`）。本 skill 做了两件事：
+
+1. **过滤推广文本**：在 import/构造之前给 `sys.stdout`/`sys.stderr` 装上过滤器，丢弃命中推广
+   标记的写入（连同其换行），其它输出（含 `初始化成功，获取到已登录窗口：…`）原样保留，不做缓冲；
+2. **关闭广告接口与遥测**：把 `WxParam.TELEMETRY_ENABLED` 置为 `False`，并清空 `AD_API_URL`、
+   `REPORT_API_URL`，避免额外的网络请求与设备指纹上报。
+
+需要还原时：`SEND_TO_FILEHELPER_SHOW_ADS=1` 放行推广文本，
+`SEND_TO_FILEHELPER_ALLOW_TELEMETRY=1` 放行遥测。
 
 ### macOS backend / macOS 后端（`scripts/wechat_mac.py`）
 
@@ -274,6 +299,8 @@ macOS 端的两点差异：好友身份无法像 Windows 那样二次确认；`-
 | `当前会话是「X」，与目标「Y」不一致` | 名称不精确；用输出的候选列表修正 `--to`（也可用 `--no-exact` 放宽） |
 | `发送后未在会话中发现任何文件消息` | 微信被遮挡/弹窗打断；保持窗口在前台、不要同时操作键鼠，然后重试 |
 | 微信提示文件过大 | 客户端对大文件有限制（超过 `--max-size-mb` 会提示）；改用其他传输方式 |
+| 每次调用出现 `当前为免费版wxauto4 / 如需更多功能可查看plus版本 / https://wxauto.org/purchase` | 这是 wxauto4 免费版自带的推广输出。本 skill 默认已过滤并关闭其广告/遥测接口；若仍出现，说明是别的东西打印的，请把原样输出发出来 |
+| 想要更少的输出 | 加 `-q/--quiet`，成功时只打印一行 `完成: …` |
 | 中文乱码（Windows） | 脚本已强制 UTF-8；仍异常时在 `cmd` 执行 `chcp 65001` |
 
 ## Notes / 注意事项
@@ -293,4 +320,6 @@ macOS 端的两点差异：好友身份无法像 Windows 那样二次确认；`-
    因此键盘模式下务必核对 `--to`，或直接用默认的「文件传输助手」。
 9. **测试/高级环境变量**：`SEND_TO_FILEHELPER_BACKEND=windows|macos` 可强制后端，
    `SEND_TO_FILEHELPER_SKIP_PLATFORM_CHECK=1` 可忽略平台检查（仅用于模拟/开发验证），
-   `SEND_TO_FILEHELPER_NO_REOPEN=1` 可禁止脚本自动 `open -b` 重开微信主窗口。
+   `SEND_TO_FILEHELPER_NO_REOPEN=1` 可禁止脚本自动 `open -b` 重开微信主窗口，
+   `SEND_TO_FILEHELPER_SHOW_ADS=1` / `SEND_TO_FILEHELPER_ALLOW_TELEMETRY=1` 可放行
+   wxauto4 免费版的推广输出与遥测（默认关闭）。

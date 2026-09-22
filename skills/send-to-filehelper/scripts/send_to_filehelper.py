@@ -48,6 +48,27 @@ WILDCARD_CHARS = ("*", "?", "[")
 PLATFORM_ESCAPE_ENV = "SEND_TO_FILEHELPER_SKIP_PLATFORM_CHECK"
 # 仅用于测试/模拟：强制使用某个后端（windows / macos）
 FORCE_BACKEND_ENV = "SEND_TO_FILEHELPER_BACKEND"
+# 需要看 wxauto4 免费版原样输出（含推广）时设置
+SHOW_ADS_ENV = "SEND_TO_FILEHELPER_SHOW_ADS"
+# 允许 wxauto4 上报遥测时设置
+ALLOW_TELEMETRY_ENV = "SEND_TO_FILEHELPER_ALLOW_TELEMETRY"
+
+# wxauto4 免费版会打印的推广内容（命中即丢弃）
+WXAUTO_AD_MARKERS = (
+    "当前为免费版",
+    "如需更多功能",
+    "wxauto.org",
+    "plus版本",
+    "plus版",
+    "Plus版",
+)
+
+QUIET = False
+
+
+def set_quiet(enabled: bool) -> None:
+    global QUIET
+    QUIET = bool(enabled)
 
 
 @dataclass
@@ -82,11 +103,13 @@ def enable_utf8_output() -> None:
 
 
 def info(message: str) -> None:
-    click.secho(message, fg="cyan")
+    if not QUIET:
+        click.secho(message, fg="cyan")
 
 
 def ok(message: str) -> None:
-    click.secho(message, fg="green")
+    if not QUIET:
+        click.secho(message, fg="green")
 
 
 def warn(message: str) -> None:
@@ -95,6 +118,81 @@ def warn(message: str) -> None:
 
 def fail(message: str) -> None:
     click.secho(f"错误: {message}", fg="red", err=True)
+
+
+class _AdFilterStream:
+    """把 wxauto4 免费版打印的推广内容挡在终端之外。
+
+    只做逐次写入的整段匹配：包含推广标记的片段直接丢弃，其余原样透传，
+    因此不会缓冲、不会影响进度输出或其它第三方输出。
+    """
+
+    def __init__(self, stream, markers: Sequence[str]) -> None:
+        self._stream = stream
+        self._markers = markers
+        self._swallow_newline = False
+
+    def write(self, text) -> int:
+        # click 会先用 bytes 探测流，这里两种类型都要能处理
+        if isinstance(text, (bytes, bytearray)):
+            raw = bytes(text)
+            probe = raw.decode("utf-8", "ignore")
+        else:
+            raw = None
+            probe = text
+        if not probe:
+            return 0
+        if any(marker in probe for marker in self._markers):
+            # print() 会先写内容再单独写 "\n"，这里标记一下把随后的换行也吃掉
+            self._swallow_newline = True
+            return len(probe)
+        if self._swallow_newline:
+            self._swallow_newline = False
+            if not probe.strip():
+                return len(probe)
+        if raw is not None:
+            buffer = getattr(self._stream, "buffer", None)
+            if buffer is not None:
+                buffer.write(raw)
+                return len(raw)
+            return self._stream.write(probe)
+        return self._stream.write(text)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def __getattr__(self, item: str):
+        return getattr(self._stream, item)
+
+
+def silence_wxauto_ads() -> None:
+    """在 import wxauto4 之前安装过滤器（推广可能在 import 或实例化时打印）。"""
+    if os.environ.get(SHOW_ADS_ENV):
+        return
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None or isinstance(stream, _AdFilterStream):
+            continue
+        setattr(sys, name, _AdFilterStream(stream, WXAUTO_AD_MARKERS))
+
+
+def configure_wxauto_privacy() -> None:
+    """关掉 wxauto4 自带的远程广告接口与遥测上报（需要时可用环境变量放行）。"""
+    if os.environ.get(ALLOW_TELEMETRY_ENV):
+        return
+    try:
+        from wxauto4.param import WxParam  # type: ignore import-not-found
+    except Exception:
+        return
+    for attribute, value in (
+        ("TELEMETRY_ENABLED", False),
+        ("AD_API_URL", ""),
+        ("REPORT_API_URL", ""),
+    ):
+        try:
+            setattr(WxParam, attribute, value)
+        except Exception:
+            pass
 
 
 def human_size(num_bytes: float) -> str:
@@ -236,7 +334,9 @@ def import_wechat_class():
 
 
 def open_wechat():
+    silence_wxauto_ads()
     WeChat = import_wechat_class()
+    configure_wxauto_privacy()
     try:
         return WeChat()
     except Exception as exc:  # wxauto4 在未登录/未启动时抛异常
@@ -538,14 +638,14 @@ def run_macos_backend(
         if not usable:
             use_keys = True
             warn(
-                "微信没有向辅助功能暴露界面内容（AX 树为空），已自动切换到键盘模式："
-                "用 Cmd+F 搜索 + 剪贴板粘贴发送。"
+                "微信未向辅助功能暴露界面内容，已自动切换到键盘模式"
+                "（Cmd+F 搜索 + 剪贴板粘贴）。"
             )
 
     if use_keys:
         warn(
-            "键盘模式无法在发送前校验会话、也无法在发送后校验消息，"
-            f"即将直接发送给「{target}」——请确认这个名称在微信里完全正确。"
+            f"键盘模式不做会话/消息校验，直接发送给「{target}」——请确认名称正确；"
+            "详情见 --check。"
         )
         report.target = target
         report.verify_note = "键盘模式（AX 树为空）不做会话/消息校验"
@@ -882,6 +982,13 @@ def check_environment(debug: bool = False) -> int:
     help="macOS 输入方式：auto 自动选择；ax 只用辅助功能；keystrokes 只用键盘（Windows 忽略）。",
 )
 @click.option(
+    "-q",
+    "--quiet",
+    is_flag=True,
+    default=False,
+    help="安静模式：只输出警告/错误和一行结果。",
+)
+@click.option(
     "--debug",
     is_flag=True,
     default=False,
@@ -905,11 +1012,13 @@ def main(
     dry_run: bool,
     check_only: bool,
     input_mode: str,
+    quiet: bool,
     debug: bool,
     as_json: bool,
 ) -> None:
     """把本地文件 / 文本发送到微信文件传输助手或指定会话（Windows / macOS）。"""
     enable_utf8_output()
+    set_quiet(quiet)
 
     if check_only:
         sys.exit(check_environment(debug=debug))
@@ -949,16 +1058,17 @@ def main(
     if after_texts:
         parts.append(f"{len(after_texts)} 条文本（文件之后）")
     info("待发送: " + "、".join(parts) if parts else "待发送: 无")
-    for text in texts:
-        click.echo(f"  [文本] {text}")
-    for path in resolved:
-        try:
-            size = human_size(path.stat().st_size)
-        except OSError:
-            size = "?"
-        click.echo(f"  [文件] {display_path(path)}  ({size})")
-    for text in after_texts:
-        click.echo(f"  [文本·后] {text}")
+    if not QUIET:
+        for text in texts:
+            click.echo(f"  [文本] {text}")
+        for path in resolved:
+            try:
+                size = human_size(path.stat().st_size)
+            except OSError:
+                size = "?"
+            click.echo(f"  [文件] {display_path(path)}  ({size})")
+        for text in after_texts:
+            click.echo(f"  [文本·后] {text}")
 
     for item in check_sizes(resolved, max_size_mb):
         warn(item)
@@ -1015,21 +1125,22 @@ def main(
         sys.exit(1)
 
     # ---- 汇总 ----
-    click.echo("")
-    click.secho("=" * 52)
-    info(f"目标会话 : {report.target}")
-    if resolved:
-        info(f"已提交   : {len(report.submitted)}/{len(resolved)} 个文件")
-    if texts or after_texts:
-        sent_texts = len(report.messages)
-        info(f"文本消息 : {sent_texts}/{len(texts) + len(after_texts)} 条")
-    if not no_verify:
-        if report.verify_note:
-            warn(f"消息校验：{report.verify_note}")
-        if report.unconfirmed:
-            warn(f"未在会话中确认到: {'、'.join(report.unconfirmed)}")
-        elif not report.verify_note:
-            ok(f"已确认全部 {len(report.confirmed)} 项内容出现在会话中")
+    if not QUIET:
+        click.echo("")
+        click.secho("=" * 52)
+        info(f"目标会话 : {report.target}")
+        if resolved:
+            info(f"已提交   : {len(report.submitted)}/{len(resolved)} 个文件")
+        if texts or after_texts:
+            sent_texts = len(report.messages)
+            info(f"文本消息 : {sent_texts}/{len(texts) + len(after_texts)} 条")
+        if not no_verify:
+            if report.verify_note:
+                warn(f"消息校验：{report.verify_note}")
+            if report.unconfirmed:
+                warn(f"未在会话中确认到: {'、'.join(report.unconfirmed)}")
+            elif not report.verify_note:
+                ok(f"已确认全部 {len(report.confirmed)} 项内容出现在会话中")
 
     result = {
         "platform": "macos" if platform == "darwin" else "windows",
@@ -1052,7 +1163,15 @@ def main(
         fail("发送后未在会话中发现任何内容，请检查微信窗口状态。")
         sys.exit(1)
 
-    ok("完成")
+    summary = f"完成: {report.target}"
+    if resolved:
+        summary += f" · {len(report.submitted)}/{len(resolved)} 个文件"
+    if texts or after_texts:
+        summary += f" · {len(report.messages)}/{len(texts) + len(after_texts)} 条文本"
+    if QUIET:
+        click.echo(summary)
+    else:
+        ok(summary)
     sys.exit(0)
 
 
