@@ -23,3 +23,9 @@ Icon[]
 Network Trash Folder
 Temporary Items
 .apdisk
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+uv.lock

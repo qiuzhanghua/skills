@@ -4,6 +4,9 @@
 # dependencies = [
 #     "click",
 #     "wxauto4; sys_platform == 'win32'",
+#     "pyobjc-framework-Cocoa; sys_platform == 'darwin'",
+#     "pyobjc-framework-Quartz; sys_platform == 'darwin'",
+#     "pyobjc-framework-ApplicationServices; sys_platform == 'darwin'",
 # ]
 #
 # [[tool.uv.index]]
@@ -11,16 +14,19 @@
 # default = true
 # ///
 """
-微信文件发送器（wxauto4）
+微信文件发送器
 
-把本地文件发送到微信「文件传输助手」或指定好友/群聊。
-仅支持 Windows + 已登录的微信 PC 客户端 4.x（wxauto4 基于 UI Automation，
-不会绕过任何微信限制）。
+把本地文件发送到微信「文件传输助手」或指定好友/群聊。两个平台后端：
+  - Windows：wxauto4（Windows UI Automation）
+  - macOS：Accessibility API（驱动微信 Mac 4.x 界面，见 wechat_mac.py）
+
+两者都只操作用户本人已登录的客户端界面，不做协议破解、不注入、不绕过限制。
 
 用法示例：
   uv run scripts/send_to_filehelper.py 报告.pdf
   uv run scripts/send_to_filehelper.py ./dist/*.zip --to 文件传输助手
   uv run scripts/send_to_filehelper.py ./out --recursive --message "构建产物"
+  uv run scripts/send_to_filehelper.py --check
 """
 
 from __future__ import annotations
@@ -30,6 +36,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -39,6 +46,22 @@ DEFAULT_TARGET = "文件传输助手"
 DEFAULT_MAX_SIZE_MB = 100
 WILDCARD_CHARS = ("*", "?", "[")
 PLATFORM_ESCAPE_ENV = "SEND_TO_FILEHELPER_SKIP_PLATFORM_CHECK"
+# 仅用于测试/模拟：强制使用某个后端（windows / macos）
+FORCE_BACKEND_ENV = "SEND_TO_FILEHELPER_BACKEND"
+
+
+@dataclass
+class Report:
+    """一次发送尝试的结果，供 main() 统一汇总/退出。"""
+
+    target: str = ""
+    submitted: List[Path] = field(default_factory=list)
+    confirmed: List[str] = field(default_factory=list)
+    unconfirmed: List[str] = field(default_factory=list)
+    verify_note: Optional[str] = None
+    errors: List[str] = field(default_factory=list)
+    abort: Optional[str] = None
+    candidates: List[str] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -197,12 +220,6 @@ def describe_result(result: object) -> Tuple[Optional[bool], str]:
     return bool(result), str(result)
 
 
-def extract_error(result: object) -> str:
-    if isinstance(result, dict):
-        return str(result.get("message") or result)
-    return str(result)
-
-
 # --------------------------------------------------------------------------- #
 # 微信交互
 # --------------------------------------------------------------------------- #
@@ -359,10 +376,267 @@ def verify_sent(
 
 
 # --------------------------------------------------------------------------- #
+# 平台后端：Windows（wxauto4）
+# --------------------------------------------------------------------------- #
+def run_windows_backend(
+    files: Sequence[Path],
+    target: str,
+    exact: bool,
+    message: Optional[str],
+    one_by_one: bool,
+    delay: float,
+    retries: int,
+    no_verify: bool,
+) -> Report:
+    report = Report()
+    try:
+        wx = open_wechat()
+        chat_info = switch_to(wx, target, exact)
+    except RuntimeError as exc:
+        report.abort = str(exc)
+        return report
+
+    chat_name = str(chat_info.get("chat_name") or "")
+    if not chat_matches(chat_name, target, exact):
+        report.abort = f"当前会话是「{chat_name or '未知'}」，与目标「{target}」不一致，已取消发送。"
+        report.candidates = suggest_sessions(wx, target)
+        return report
+
+    report.target = chat_name
+    ok(f"已切换到会话: {chat_name}")
+
+    if message:
+        try:
+            msg_result = wx.SendMsg(message)
+        except Exception as exc:
+            report.abort = f"发送文本消息失败: {exc}"
+            return report
+        msg_ok, msg_detail = describe_result(msg_result)
+        if msg_ok is False:
+            report.abort = f"发送文本消息失败: {msg_detail}"
+            return report
+        info(f"已发送文本消息: {message}")
+        if delay > 0:
+            time.sleep(delay)
+
+    sent, errors = send_batches(wx, files, one_by_one, delay, max(retries, 0))
+    report.errors = errors
+    report.submitted = sent
+    if not sent:
+        report.abort = "没有任何文件发送成功"
+        return report
+
+    if delay > 0:
+        time.sleep(delay)
+
+    if not no_verify:
+        report.confirmed, report.unconfirmed, report.verify_note = verify_sent(wx, sent)
+    return report
+
+
+# --------------------------------------------------------------------------- #
+# 平台后端：macOS（Accessibility API）
+# --------------------------------------------------------------------------- #
+def _match_by_filename(
+    texts: Sequence[str], files: Sequence[Path]
+) -> Tuple[List[str], List[str]]:
+    confirmed: List[str] = []
+    missing: List[str] = []
+    for path in files:
+        stem = path.stem
+        hit = any(path.name in text or (stem and stem in text) for text in texts)
+        (confirmed if hit else missing).append(path.name)
+    return confirmed, missing
+
+
+def run_macos_backend(
+    files: Sequence[Path],
+    target: str,
+    exact: bool,
+    message: Optional[str],
+    one_by_one: bool,
+    delay: float,
+    retries: int,
+    no_verify: bool,
+) -> Report:
+    from wechat_mac import MacBackendError, MacWeChat
+
+    report = Report()
+    if retries:
+        warn("macOS 后端不支持 --retries，已忽略。")
+
+    try:
+        wx = MacWeChat()
+        wx.activate()
+    except MacBackendError as exc:
+        report.abort = str(exc)
+        return report
+
+    if target != DEFAULT_TARGET:
+        warn(
+            f"macOS 端无法像 Windows 那样二次确认好友身份；即将发送给「{target}」，"
+            "请确认名称准确无误。"
+        )
+
+    try:
+        opened, current, candidates = wx.open_chat(target, exact=exact)
+    except MacBackendError as exc:
+        report.abort = str(exc)
+        return report
+    report.candidates = candidates
+
+    if not opened:
+        report.abort = f"未能切换到会话「{target}」（当前会话：「{current or '未知'}」），已取消发送。"
+        return report
+
+    report.target = current or target
+    ok(f"已切换到会话: {report.target}")
+
+    before: Optional[List[str]] = None
+    if not no_verify:
+        try:
+            before = wx.message_texts()
+        except Exception:
+            before = None
+
+    try:
+        if message:
+            wx.send_text(message)
+            info(f"已发送文本消息: {message}")
+            if delay > 0:
+                time.sleep(delay)
+
+        info(f"粘贴文件并发送: {'、'.join(path.name for path in files)}")
+        wx.send_files(
+            [str(path) for path in files], batch=not one_by_one, interval=delay
+        )
+    except MacBackendError as exc:
+        report.abort = str(exc)
+        return report
+
+    report.submitted = list(files)
+
+    if no_verify:
+        return report
+
+    try:
+        after = wx.message_texts()
+    except Exception as exc:
+        after = None
+        report.verify_note = f"无法读取会话消息: {exc}"
+
+    if after is None:
+        report.verify_note = (
+            report.verify_note or "无法读取会话消息列表（微信可能未渲染或辅助功能受限）"
+        )
+        return report
+
+    confirmed, missing = _match_by_filename(after, files)
+    if not confirmed and before is not None and len(after) > len(before):
+        # 没有匹配到文件名，但确实多出了新消息 —— 大概率已发送成功
+        report.confirmed = [path.name for path in files]
+        report.verify_note = "检测到新消息，但未在消息文本中匹配到文件名"
+        return report
+
+    report.confirmed = confirmed
+    report.unconfirmed = missing
+    return report
+
+
+# --------------------------------------------------------------------------- #
+# 环境自检
+# --------------------------------------------------------------------------- #
+def check_environment() -> int:
+    """检查当前平台的后端是否可用，返回退出码。"""
+    platform = sys.platform
+    problems: List[str] = []
+
+    if platform == "win32":
+        info("平台: Windows（后端: wxauto4 / UI Automation）")
+        try:
+            wx = open_wechat()
+        except RuntimeError as exc:
+            fail(str(exc))
+            return 1
+        try:
+            chat_info = wx.ChatInfo()
+        except Exception as exc:
+            fail(f"读取当前会话信息失败: {exc}")
+            return 1
+        ok("wxauto4 可用")
+        ok(f"当前会话: {chat_info.get('chat_name') or '未知'}")
+        try:
+            from wxauto4 import __version__ as wxauto_version  # type: ignore
+
+            if wxauto_version:
+                info(f"wxauto4 版本: {wxauto_version}")
+        except Exception:
+            pass
+        return 0
+
+    if platform == "darwin":
+        from wechat_mac import MacBackendError, MacWeChat
+
+        info("平台: macOS（后端: Accessibility API）")
+        try:
+            running = MacWeChat.is_running()
+        except Exception as exc:  # pyobjc 缺失
+            fail(str(exc))
+            return 1
+
+        if running:
+            ok(f"微信 Mac 客户端正在运行（版本 {MacWeChat.version() or '未知'}）")
+        else:
+            problems.append("未检测到正在运行的微信 Mac 客户端，请先打开并登录。")
+
+        if MacWeChat.permission_granted():
+            ok("辅助功能权限: 已授予")
+        else:
+            problems.append(
+                "辅助功能权限: 未授予。请到「系统设置 → 隐私与安全性 → 辅助功能」"
+                "勾选运行本命令的宿主 App（Terminal / iTerm / VS Code / dsh 等），"
+                "然后完全退出并重开该 App。"
+            )
+
+        if running and MacWeChat.permission_granted():
+            try:
+                wx = MacWeChat()
+                wx.activate()
+                current = wx.current_chat()
+                if current:
+                    ok(f"会话标题可读，当前会话: {current}")
+                else:
+                    problems.append(
+                        "无法读取会话标题（big_title_line_h_view），"
+                        "请确认微信主窗口已打开且未最小化。"
+                    )
+                rows = wx.sidebar_rows()
+                info(f"会话列表可见行数: {len(rows)}")
+                if rows:
+                    info("会话示例: " + "、".join(row.name for row in rows[:5]))
+                wx.focus_input()
+                ok("聊天输入框可定位（chat_input_field）")
+            except MacBackendError as exc:
+                problems.append(str(exc))
+            except Exception as exc:
+                problems.append(f"读取微信界面失败: {exc}")
+
+        if problems:
+            for item in problems:
+                fail(item)
+            return 1
+        ok("macOS 后端自检通过")
+        return 0
+
+    fail(f"不支持的平台: {platform}（仅支持 Windows 与 macOS）")
+    return 1
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
-@click.argument("files", nargs=-1, required=True, metavar="FILE...")
+@click.argument("files", nargs=-1, required=False, metavar="[FILE...]")
 @click.option(
     "--to",
     "-t",
@@ -402,7 +676,11 @@ def verify_sent(
     help="超过该大小则给出提示（微信客户端可能拒收大文件）。",
 )
 @click.option(
-    "--retries", type=int, default=0, show_default=True, help="发送失败后的重试次数。"
+    "--retries",
+    type=int,
+    default=0,
+    show_default=True,
+    help="发送失败后的重试次数（仅 Windows）。",
 )
 @click.option(
     "--no-verify",
@@ -414,7 +692,14 @@ def verify_sent(
     "--dry-run",
     is_flag=True,
     default=False,
-    help="只打印将要发送的文件，不操作微信（可在非 Windows 上执行）。",
+    help="只打印将要发送的文件，不操作微信（可在任意平台执行）。",
+)
+@click.option(
+    "--check",
+    "check_only",
+    is_flag=True,
+    default=False,
+    help="只做环境自检（权限/微信/后端可用性）。",
 )
 @click.option(
     "--json", "as_json", is_flag=True, default=False, help="以 JSON 输出结果摘要。"
@@ -431,10 +716,14 @@ def main(
     retries: int,
     no_verify: bool,
     dry_run: bool,
+    check_only: bool,
     as_json: bool,
 ) -> None:
-    """把本地文件发送到微信文件传输助手或指定会话（Windows + wxauto4）。"""
+    """把本地文件发送到微信文件传输助手或指定会话（Windows / macOS）。"""
     enable_utf8_output()
+
+    if check_only:
+        sys.exit(check_environment())
 
     resolved, problems = expand_inputs(files, recursive)
     if problems:
@@ -470,92 +759,64 @@ def main(
         ok("dry-run：未执行任何微信操作")
         sys.exit(0)
 
-    if sys.platform != "win32" and not os.environ.get(PLATFORM_ESCAPE_ENV):
+    platform = sys.platform
+    forced = os.environ.get(FORCE_BACKEND_ENV, "").strip().lower()
+    if forced == "windows":
+        platform = "win32"
+    elif forced == "macos":
+        platform = "darwin"
+
+    if platform not in ("win32", "darwin") and not os.environ.get(PLATFORM_ESCAPE_ENV):
         fail(
-            "本 skill 只能在 Windows 上运行：wxauto4 依赖 Windows UI Automation "
-            "与已登录的微信 PC 客户端 4.x。"
+            f"不支持的平台: {platform}。仅支持 Windows（wxauto4）与 macOS（辅助功能）。"
         )
         sys.exit(1)
 
-    try:
-        wx = open_wechat()
-        chat_info = switch_to(wx, target, exact)
-    except RuntimeError as exc:
-        fail(str(exc))
-        sys.exit(1)
-
-    chat_name = str(chat_info.get("chat_name") or "")
-    if not chat_matches(chat_name, target, exact):
-        fail(
-            f"当前会话是「{chat_name or '未知'}」，与目标「{target}」不一致，已取消发送。"
+    if platform == "darwin":
+        report = run_macos_backend(
+            resolved, target, exact, message, one_by_one, delay, retries, no_verify
         )
-        candidates = suggest_sessions(wx, target)
-        if candidates:
-            info("当前会话列表（可用于修正 --to）: " + "、".join(candidates))
+    else:
+        report = run_windows_backend(
+            resolved, target, exact, message, one_by_one, delay, retries, no_verify
+        )
+
+    if report.abort:
+        fail(report.abort)
+        if report.candidates:
+            info("候选会话（可用于修正 --to）: " + "、".join(report.candidates[:10]))
         sys.exit(1)
-
-    ok(f"已切换到会话: {chat_name}")
-
-    if message:
-        try:
-            msg_result = wx.SendMsg(message)
-        except Exception as exc:
-            fail(f"发送文本消息失败: {exc}")
-            sys.exit(1)
-        msg_ok, msg_detail = describe_result(msg_result)
-        if msg_ok is False:
-            fail(f"发送文本消息失败: {msg_detail}")
-            sys.exit(1)
-        info(f"已发送文本消息: {message}")
-        if delay > 0:
-            time.sleep(delay)
-
-    sent, errors = send_batches(wx, resolved, one_by_one, delay, max(retries, 0))
-    for item in errors:
-        fail(item)
-
-    if not sent:
-        fail("没有任何文件发送成功")
-        sys.exit(1)
-
-    if delay > 0:
-        time.sleep(delay)
-
-    confirmed: List[str] = []
-    unconfirmed: List[str] = []
-    verify_note: Optional[str] = None
-    if not no_verify:
-        confirmed, unconfirmed, verify_note = verify_sent(wx, sent)
 
     # ---- 汇总 ----
     click.echo("")
     click.secho("=" * 52)
-    info(f"目标会话 : {chat_name}")
-    info(f"已提交   : {len(sent)}/{len(resolved)} 个文件")
+    info(f"目标会话 : {report.target}")
+    info(f"已提交   : {len(report.submitted)}/{len(resolved)} 个文件")
     if not no_verify:
-        if verify_note:
-            warn(f"消息校验不可用：{verify_note}")
-        elif unconfirmed:
-            warn(f"未在会话中确认到: {'、'.join(unconfirmed)}")
-        else:
-            ok(f"已确认全部 {len(confirmed)} 个文件出现在会话中")
+        if report.verify_note:
+            warn(f"消息校验：{report.verify_note}")
+        if report.unconfirmed:
+            warn(f"未在会话中确认到: {'、'.join(report.unconfirmed)}")
+        elif not report.verify_note:
+            ok(f"已确认全部 {len(report.confirmed)} 个文件出现在会话中")
 
     result = {
-        "target": chat_name,
+        "platform": "macos" if platform == "darwin" else "windows",
+        "target": report.target,
         "requested": [str(path) for path in resolved],
-        "submitted": [str(path) for path in sent],
-        "confirmed": confirmed,
-        "unconfirmed": unconfirmed,
-        "errors": errors,
-        "verify_note": verify_note,
+        "submitted": [str(path) for path in report.submitted],
+        "confirmed": report.confirmed,
+        "unconfirmed": report.unconfirmed,
+        "errors": report.errors,
+        "verify_note": report.verify_note,
     }
     if as_json:
         click.echo(json.dumps(result, ensure_ascii=False, indent=2))
 
-    if errors:
+    if report.errors:
         sys.exit(1)
     # 会话消息里一个都没看到 → 视为失败（除非用户主动关闭校验）
-    if not no_verify and not verify_note and not confirmed:
+    if not no_verify and not report.verify_note and not report.confirmed:
         fail("发送后未在会话中发现任何文件消息，请检查微信窗口状态。")
         sys.exit(1)
 
