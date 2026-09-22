@@ -617,11 +617,17 @@ def check_environment(debug: bool = False) -> int:
         info(f"AX 窗口数: {len(windows)}")
         for summary in wx.window_summaries():
             info(f"  - {summary}")
+        for line in wx.probe():
+            info(f"  {line}")
         if not windows:
             fail(
-                "微信主窗口没有打开：AX 树里没有任何窗口。\n"
-                "  处理：点一下 Dock 栏里的微信图标（或菜单栏微信 → 打开微信），"
-                "让主窗口显示出来后再运行 --check。"
+                "AX 树里没有任何窗口。两种可能：\n"
+                "  1. 微信主窗口确实没打开 → 点 Dock 栏的微信图标打开主窗口；\n"
+                "  2. 当前进程的辅助功能调用被沙箱/包装环境拦截 → 改在系统自带的 "
+                "Terminal.app 或 iTerm 里直接运行本命令（不要经由 IDE 的沙箱终端或"
+                "其它包装过的 shell）。\n"
+                "  上面的 AX 错误码可以区分两者：出现 cannotComplete / apiDisabled / "
+                "invalidUIElement 基本都是第 2 种。"
             )
             return 1
 

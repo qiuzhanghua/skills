@@ -67,6 +67,7 @@ try:  # pragma: no cover - 依赖导入
         AXValueGetType,
         AXValueGetValue,
         kAXChildrenAttribute,
+        kAXFocusedWindowAttribute,
         kAXIdentifierAttribute,
         kAXPositionAttribute,
         kAXRaiseAction,
@@ -397,6 +398,31 @@ class MacWeChat:
             if size is None or (size[0] >= 80 and size[1] >= 80):
                 result.append(window)
         return result
+
+    def probe(self) -> List[str]:
+        """对应用元素做最小 AX 探测，输出人类可读的诊断行。
+
+        用来区分三类失败：AX 被拦截（返回错误码）、应用根本没有窗口、
+        或树能读但标识不认识（版本差异）。
+        """
+        lines: List[str] = []
+        role_err, role = ax_copy(self.ax_app, kAXRoleAttribute)
+        lines.append(f"应用元素 AXRole -> {role!r} ({ax_error_name(role_err)})")
+
+        win_err, win_value = ax_copy(self.ax_app, kAXWindowsAttribute)
+        count = len(win_value) if isinstance(win_value, (list, tuple)) else 0
+        lines.append(f"AXWindows -> {count} 个 ({ax_error_name(win_err)})")
+
+        children_err, children = ax_copy(self.ax_app, kAXChildrenAttribute)
+        child_count = len(children) if isinstance(children, (list, tuple)) else 0
+        lines.append(f"AXChildren -> {child_count} 个 ({ax_error_name(children_err)})")
+
+        focused_err, focused = ax_copy(self.ax_app, kAXFocusedWindowAttribute)
+        lines.append(
+            f"AXFocusedWindow -> {'有' if focused is not None else '无'} "
+            f"({ax_error_name(focused_err)})"
+        )
+        return lines
 
     def try_enable_enhanced_ui(self) -> List[Tuple[str, int]]:
         """尝试打开微信的完整辅助功能树（部分应用需要这个握手）。"""
