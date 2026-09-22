@@ -5,6 +5,7 @@
 - maven-profile-selector
 - tdp-plugin-backup
 - tdp-plugin-restore
+- send-to-filehelper
 
 ## Usage
 
