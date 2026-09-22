@@ -399,6 +399,52 @@ class MacWeChat:
                 result.append(window)
         return result
 
+    @staticmethod
+    def related_processes() -> List[str]:
+        """列出所有微信相关进程及其 AX 窗口数。
+
+        微信 4.x 是多进程架构，界面有可能不属于 `com.tencent.xinWeChat`
+        主进程；当主进程读不到窗口时用这个列表确认界面到底在谁那里。
+        """
+        _require_frameworks()
+        lines: List[str] = []
+        try:
+            apps = AppKit.NSWorkspace.sharedWorkspace().runningApplications()
+        except Exception as exc:
+            _debug(f"枚举进程失败: {exc}")
+            return lines
+
+        for app in apps:
+            try:
+                bundle_id = str(app.bundleIdentifier() or "")
+                url = app.bundleURL()
+                path = str(url.path() or "") if url is not None else ""
+            except Exception:
+                continue
+            if "com.tencent.xinWeChat" not in bundle_id and "WeChat" not in path:
+                continue
+            count = -1
+            try:
+                element = AXUIElementCreateApplication(app.processIdentifier())
+                try:
+                    AXUIElementSetMessagingTimeout(element, 1.0)
+                except Exception:
+                    pass
+                err, value = ax_copy(element, kAXWindowsAttribute)
+                if err == 0 and isinstance(value, (list, tuple)):
+                    count = len(value)
+                else:
+                    count = -1
+            except Exception as exc:
+                _debug(f"探测 pid={app.processIdentifier()} 失败: {exc}")
+            name = str(app.localizedName() or "?")
+            lines.append(
+                f"pid={int(app.processIdentifier())} {name!r} "
+                f"bundle={bundle_id or '-'} AX窗口={count if count >= 0 else '读取失败'} "
+                f"path={path or '-'}"
+            )
+        return lines
+
     def probe(self) -> List[str]:
         """对应用元素做最小 AX 探测，输出人类可读的诊断行。
 

@@ -620,6 +620,11 @@ def check_environment(debug: bool = False) -> int:
         for line in wx.probe():
             info(f"  {line}")
         if not windows:
+            related = wx.related_processes()
+            if related:
+                info("微信相关进程及其 AX 窗口:")
+                for line in related:
+                    info(f"  {line}")
             fail(
                 "AX 树里没有任何窗口。两种可能：\n"
                 "  1. 微信主窗口确实没打开 → 点 Dock 栏的微信图标打开主窗口；\n"
