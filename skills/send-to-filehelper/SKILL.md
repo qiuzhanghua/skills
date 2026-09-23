@@ -16,7 +16,7 @@ of the user. Two platform backends share one CLI:
 
 | Platform | Backend | Mechanism |
 | --- | --- | --- |
-| Windows | [`wxauto4`](https://pypi.org/project/wxauto4/) | Windows UI Automation |
+| Windows | [`wxautox4`](https://pypi.org/project/wxautox4/) (Plus) if installed, else [`wxauto4`](https://pypi.org/project/wxauto4/) (free) | Windows UI Automation |
 | macOS | `pyobjc` (Accessibility API) | macOS AX tree + clipboard paste + synthetic keys |
 
 本 skill 把**本地文件和/或文字**发送到微信「文件传输助手」（或指定好友/群聊），两个平台共用同一
@@ -24,7 +24,7 @@ of the user. Two platform backends share one CLI:
 
 | 平台 | 后端 | 原理 |
 | --- | --- | --- |
-| Windows | wxauto4 | Windows UI Automation |
+| Windows | 装了 Plus 版就用 `wxautox4`，否则用 `wxauto4` | Windows UI Automation |
 | macOS | pyobjc（Accessibility API） | 读取微信 4.x 辅助功能树 + 剪贴板粘贴 + 合成键鼠事件 |
 
 Both backends only operate the user's own logged-in client: no protocol reverse-engineering, no
@@ -53,14 +53,104 @@ automated outreach. It is intended only for the user's own account and conversat
 | Item | Windows | macOS |
 | --- | --- | --- |
 | OS | Windows 10 / 11 | macOS（macOS 15 + 微信 4.1.13 实测） |
-| Client | Windows 版微信 **4.x**，已登录，主窗口未最小化 | 微信 Mac 版 **4.x**（`WeChat.app`），已登录 |
+| Client | Windows 版微信，已登录，主窗口未最小化。**免费版最高只支持客户端 `4.1.8.107`**，见下节 | 微信 Mac 版 **4.x**（`WeChat.app`），已登录 |
 | Python | 由 `uv` 自动管理（`>=3.10,<3.13`） | 同左 |
-| Dependency | `wxauto4`（uv 自动安装） | `pyobjc-framework-Cocoa / Quartz / ApplicationServices`（uv 自动安装） |
+| Dependency | `wxauto4` 免费版（uv 自动安装）；可选 Plus 版 `wxautox4`（付费，见下节） | `pyobjc-framework-Cocoa / Quartz / ApplicationServices`（uv 自动安装） |
 | Permission | 无（UI Automation 不需要额外授权） | **必须**授予「辅助功能」权限给运行命令的宿主 App |
-| Input mode | wxauto4（会话校验 + 发送） | 辅助功能模式（可校验）或键盘模式（微信 4.1.x 实测走这条） |
+| Input mode | 后端自动选择（会话校验 + 发送） | 辅助功能模式（可校验）或键盘模式（微信 4.1.x 实测走这条） |
 | Tool | [`uv`](https://docs.astral.sh/uv/) | 同左 |
 
 Linux is not supported. Linux 不支持。
+
+### Windows client compatibility / Windows 客户端版本兼容
+
+**`wxauto4` 免费版官方最高只支持微信客户端 `4.1.8.107`**（见
+[wxauto 安装文档](https://docs.wxauto.org/docs/install.html)）。比它更新的客户端不再向 UI Automation
+暴露免费版需要的控件树（`mmui::MainWindow` 等），于是 `WeChat()` 抛
+`未找到已登录的客户端主窗口` 并白等约 120 秒——**这不是登录、最小化或权限问题，重试也不会成功**。
+
+实测（客户端 `4.1.12.55`）：主窗口 `Qt51514QWindowIcon` 的 UIA 子树只有两个节点
+（`Qt51514QWindowIcon`/`Weixin` 与 `MMUIRenderSubWindowHW`），**完全没有 `mmui::*` 控件**。
+把窗口最大化到 3872×2072 也一样（微信 4.x 只给可见区域注册控件，但这里不是尺寸问题）。
+所以免费版和 PyPI 上的 Plus 版（`wxautox4 41.1.1.post1`）都会报 `未找到已登录的客户端主窗口`。
+
+**排查工具**（建议在换客户端前、以及以后每次微信大版本更新后跑一次）：
+
+```bash
+uv run scripts/wechat_tree.py            # 打印主窗口真实控件树并给出结论
+uv run scripts/wechat_tree.py --json     # 机器可读
+uv run scripts/wechat_tree.py --full     # 打印全部节点
+uv run scripts/wechat_tree.py --maximize # 先把主窗口最大化再检查
+```
+
+判定 `mmui::*` 控件是否存在（只有带双冒号的才是真控件；`MMUIRenderSubWindowHW` 这种外壳不算）。
+控件树可用时退出码 `0`，不可用时 `1`——**不可用就不要再折腾代码或后端了，换客户端版本**。
+
+**必须在普通终端（非受限沙箱）里运行**：wxautox4 的授权状态存在 `~/.wxautox`，两个后端又都依赖
+UI Automation 跨进程访问微信。在受限沙箱里运行时会出现两种假故障：
+
+- `~/.wxautox` 不可写 → Plus 版读不到授权，报「未授权设备」（**其实已经激活成功**）；
+- 对微信的 UIA 调用阻塞约 60 秒并返回空树 → 任何后端都找不到主窗口。
+
+脚本会在 Plus 版授权目录不可写时提前给出这个结论，而不是让你去排查登录状态。
+
+脚本因此在 Windows 上做了两件事：
+
+1. **前端预检**（纯 stdlib，不依赖后端）：枚举正在运行的 `Weixin.exe` / `WeChat.exe`，读它的文件
+   版本，检查主窗口是否存在；最小化的主窗口会被自动还原。版本超出免费版上限时，**在构造客户端
+   之前**就中止，并直接给出下面两条出路（不再白等 120 秒再报一个误导性的错误）。
+2. **优先使用 Plus 版后端**：装了 `wxautox4` 就自动用 `wxautox4`（Plus 版跟随新版客户端更新），
+   没装则回落免费版 `wxauto4`。
+
+### 自研后端（`--wx-backend own`）/ Built-in backend
+
+免费版和 Plus 版都依赖客户端暴露 UIA 控件树，而微信 4.1.12.x 根本不暴露（见上）。为此本 skill
+还带了一个**自研后端** `scripts/wechat_win.py`，完全不用 UIA 控件树，改成像人一样操作界面：
+
+| 环节 | 做法 |
+| --- | --- |
+| 定位界面 | `PrintWindow` 截窗口 + **Windows OCR** 读文字及其坐标（地标） |
+| 会话校验 | OCR 读聊天区标题，**发送前硬校验**当前会话（安全底线，与 wxauto4 后端一致） |
+| 切换会话 | OCR 找到左侧会话列表里目标名字的行，点它，再复核标题 |
+| 发送文本 | 聚焦输入框 → 剪贴板 + `Ctrl+V` → `Enter` |
+| 发送文件 | 点工具栏「发送文件」→ 文件对话框填路径 → 回车 |
+| 发送校验 | 多次催重绘后 OCR，确认内容出现（微信重绘是异步的，单帧常是旧画面） |
+
+```bash
+uv run scripts/send_to_filehelper.py -m "说明" --wx-backend own     # 发文本
+uv run scripts/send_to_filehelper.py ./报告.pdf --wx-backend own    # 发文件
+```
+
+等价的强制方式是 `SEND_TO_FILEHELPER_WX_BACKEND=own`。
+
+**这个后端的注意事项**（都在实测中踩过）：
+
+- **必须在“已解锁的交互桌面”上运行**。锁屏、RDP 断开时 `SetCursorPos` 会返回「拒绝访问」，
+  任何键鼠自动化都无法工作（分辨率也可能被系统降级）。这不是脚本的问题。
+- **必须开启 DPI 感知**（脚本内部已调用 `SetProcessDpiAwareness`）。否则 `GetWindowRect`
+  返回被虚拟化缩放的坐标，截图区域与 OCR 坐标整体错位，表现为**聊天区一片空白、读不到控件**。
+- **微信的界面重绘是异步的**：刚发完消息时截图很可能还是旧画面。脚本会用
+  `RedrawWindow` 催重绘 + 多次截图取并集来做校验，不要根据单张截图判断成败。
+- 会话列表宽度是**固定像素**（约 740px），聊天区太窄时微信不渲染工具栏；脚本会把窗口收成
+  一个完整可见、够宽的尺寸（同 wxauto4 的 `auto_resize`）。
+- 发给**非默认会话**时，OCR 名称必须能精确匹配；不确定就用默认的「文件传输助手」。
+- **发送后校验是"尽力而为"**：自研后端依赖 OCR 复核，而微信窗口截图经常滞后（实测：
+  消息已经到达，截图里却还是上一条）。因此复核不到**不算失败**，技能会打印一条
+  `消息校验：…未能复核…` 的提示并以退出码 0 结束。**判定是否送达请看微信界面本身。**
+- 机器上可能**同时开着两个微信**（一个已登录、一个停在扫码登录页）。脚本靠 OCR 区分
+  （有「搜索/发送」的是主窗口，有「扫码登录/仅传输文件」的是登录页），不会选错。
+
+```bash
+# 免费版：把客户端换到受支持的 4.1.8.107
+#   https://github.com/SiverKing/wechat4.0-windows-versions/releases/tag/v4.1.8.107
+
+# Plus 版（付费）：装上并激活后，本命令会自动优先使用它
+uv run --with wxautox4 scripts/send_to_filehelper.py ./out -m "说明"
+wxautox4 auth activate <激活码>        # 首次需要激活（未激活时后端会直接退出）
+```
+
+`SEND_TO_FILEHELPER_WX_BACKEND=free|plus` 可强制指定后端（默认 `auto`）；
+`SEND_TO_FILEHELPER_SKIP_CLIENT_CHECK=1` 可跳过这套预检强行尝试。
 
 ### macOS input modes / macOS 两种输入方式
 
@@ -97,6 +187,9 @@ Run from this skill's directory with `uv`（依赖由脚本头部内联元数据
 ```bash
 # 环境自检（强烈建议先跑一次，尤其是 macOS 首次使用）
 uv run scripts/send_to_filehelper.py --check
+
+# Windows：改用官方 Plus 版后端（需要先激活；装了就会自动优先使用）
+uv run --with wxautox4 scripts/send_to_filehelper.py --check
 
 # 发送单个文件到「文件传输助手」
 uv run scripts/send_to_filehelper.py "C:\work\报告.pdf"      # Windows
@@ -192,7 +285,10 @@ wx.SendFiles(r'C:\你的文件路径\报告.pdf', '文件传输助手')
 
 ### Windows backend / Windows 后端
 
-1. `WeChat()` 连接已登录的微信客户端，失败给出可执行排查提示；
+0. **预检 + 选后端**（纯 stdlib）：枚举进程与顶层窗口，确认微信在运行、读客户端文件版本、
+   必要时还原最小化的主窗口；版本超出免费版上限且没装 Plus 版时直接中止。然后按
+   `wxautox4` → `wxauto4` 的顺序导入后端（`SEND_TO_FILEHELPER_WX_BACKEND` 可强制）；
+1. `WeChat(ads=False)` 连接已登录的微信客户端（`ads=False` 关掉免费版横幅），失败给出可执行排查提示；
 2. `wx.ChatWith(target, exact=True)` 切换会话；
 3. `wx.ChatInfo()['chat_name']` 与目标比对，不一致即中止并列出候选会话；
 4. 文本用 `wx.SendMsg(text)` 逐条发送（返回值同样兼容 `WxResponse` 与 `None`）；
@@ -202,20 +298,27 @@ wx.SendFiles(r'C:\你的文件路径\报告.pdf', '文件传输助手')
 
 #### 关于 wxauto4 免费版的推广输出 / silencing the free-version banner
 
-`wxauto4` 免费版在构造客户端时会打印：
+`wxauto4` 41.1.7 免费版在构造客户端时会打印（新版文案）：
 
 ```
-当前为免费版wxauto4
-如需更多功能可查看plus版本
-https://wxauto.org/purchase
+====================================================================
+当前为免费版wxauto4，如需更多功能可查看plus版本：
+https://work.weixin.qq.com/kfid/kfc2576aec57f59362a
+
+wx = WeChat(ads=False) 可取消输出该内容，如有打扰请见谅
+====================================================================
 ```
 
-而且 `wxauto4.param.WxParam` 里带着远程广告与遥测开关（`AD_API_URL`、`REPORT_API_URL`、
-`TELEMETRY_ENABLED=True`）。本 skill 做了两件事：
+这段横幅由编译后的扩展直接写底层 stdout，**Python 层过滤器拦不住**（只有早期版本能兜住）。
+另外 `WxParam` 里带着远程广告与遥测开关（`AD_API_URL`、`REPORT_API_URL`、
+`TELEMETRY_ENABLED=True`）。本 skill 因此做了三件事：
 
-1. **过滤推广文本**：在 import/构造之前给 `sys.stdout`/`sys.stderr` 装上过滤器，丢弃命中推广
-   标记的写入（连同其换行），其它输出（含 `初始化成功，获取到已登录窗口：…`）原样保留，不做缓冲；
-2. **关闭广告接口与遥测**：把 `WxParam.TELEMETRY_ENABLED` 置为 `False`，并清空 `AD_API_URL`、
+1. **从源头关掉横幅**：构造时传 `ads=False`（旧版本不认这个参数时自动退回无参调用）；
+2. **兜底过滤推广文本**：给 `sys.stdout`/`sys.stderr` 装上过滤器，丢弃命中推广标记的写入（连同其
+   换行）。过滤器只匹配推广专用片段（如 `wxauto.org/purchase`、`work.weixin.qq.com/kfid`），
+   **不会**误伤 `docs.wxauto.org` 这类正常链接；本脚本自己的 `info/ok/warn/fail` 输出走保存下来的
+   原始流，永远不会被过滤器吞掉；
+3. **关闭广告接口与遥测**：把 `WxParam.TELEMETRY_ENABLED` 置为 `False`，并清空 `AD_API_URL`、
    `REPORT_API_URL`，避免额外的网络请求与设备指纹上报。
 
 需要还原时：`SEND_TO_FILEHELPER_SHOW_ADS=1` 放行推广文本，
@@ -304,12 +407,21 @@ macOS 端的两点差异：好友身份无法像 Windows 那样二次确认；`-
 | macOS 窗口 `minimized=True` | 主窗口被最小化，脚本会激活微信但不会自动还原；先手动展开窗口 |
 | macOS 辅助功能模式下会话标题读得到、但发送失败 | 用 `--debug` 看 AX 错误码（`cannotComplete` 多为微信界面正忙），稍后重试 |
 | 非 Windows/macOS 平台 | 不支持；可在这些平台上用 `--dry-run` 仅确认清单 |
-| Windows `无法连接微信 PC 客户端` | 启动并登录微信 4.x；主窗口不要最小化到托盘；确认微信版本与 wxauto4 兼容 |
+| Windows 报 `未找到已登录的客户端主窗口`，或提示「客户端版本超出免费版兼容范围」 | 免费版最高只支持客户端 **4.1.8.107**。换成受支持版本（[4.1.8.107 归档](https://github.com/SiverKing/wechat4.0-windows-versions/releases/tag/v4.1.8.107)），或改用 Plus 版 `uv run --with wxautox4 scripts/send_to_filehelper.py ...`（需激活）。详见「Windows 客户端版本兼容」 |
+| Windows `无法连接微信 PC 客户端` | 启动并登录微信并保持主窗口打开（不要只留在托盘）；`--check` 会打印检测到的客户端路径、版本、主窗口状态与当前用的是哪个后端 |
+| Windows 提示「没有找到可见的主窗口」 | 微信被关进托盘/系统栏了：点开微信主窗口后重试（脚本只自动还原最小化，不会从托盘唤起） |
+| Windows 报「后端直接退出（退出码 1）」 | 用的是 Plus 版且设备未授权：`wxautox4 auth activate <激活码>`；或设 `SEND_TO_FILEHELPER_WX_BACKEND=free` 回到免费版 |
+| Plus 版已激活，但仍报「未授权设备」 | 多半是跑在受限沙箱里：`~/.wxautox` 不可写，授权状态读不到。`wxautox4 auth check` 会显示 `active:false`。请在普通终端重跑（脚本也会在授权目录不可写时直接提示） |
+| 想确认到底是客户端问题还是代码问题 | 跑 `uv run scripts/wechat_tree.py`：打印主窗口真实控件树。没有 `mmui::*` 就说明客户端不发布界面，和实现无关 |
+| `--wx-backend own` 报 `SetCursorPos ... 拒绝访问` | **当前桌面不可交互**（锁屏 / RDP 断开）。解锁屏幕后重试；这时任何键鼠自动化都不工作 |
+| `--wx-backend own` 读到的界面"一片空白"、找不到「发送」 | 多半是 DPI 感知没生效（脚本已内置）或窗口被盖住/比屏幕还大。脚本会先把窗口收成完整可见的尺寸并催重绘 |
+| 认为自己"发送失败"但对方其实收到了 | 微信界面重绘是异步的，**单张截图可能是旧画面**。以会话列表的预览文字为准，或稍等再截图核对 |
+| 认为「窗口太小导致控件树被隐藏」 | 微信 4.x 确实只给可见区域注册控件，但实测把窗口最大化到 3872×2072 后节点数仍是 2，所以本机不是尺寸问题；可用 `wechat_tree.py --maximize` 自行复核 |
 | `当前会话是「X」，与目标「Y」不一致` | 名称不精确；用输出的候选列表修正 `--to`（也可用 `--no-exact` 放宽） |
 | `发送后未在会话中发现任何文件消息` | 微信被遮挡/弹窗打断；保持窗口在前台、不要同时操作键鼠，然后重试 |
 | 微信提示文件过大 | 客户端对大文件有限制（超过 `--max-size-mb` 会提示）；改用其他传输方式 |
 | 每次调用弹出微信搜索面板（含「文件传输助手」并列的介绍/推荐条目） | 这是微信客户端自己的搜索界面，脚本无法屏蔽。先手动打开目标会话，再用 `--no-switch` 发送即可完全不触发；也可用 `--search-delay 0.2` 缩短它显示的时间 |
-| 每次调用出现 `当前为免费版wxauto4 / 如需更多功能可查看plus版本 / https://wxauto.org/purchase` | 这是 wxauto4 免费版自带的推广输出。本 skill 默认已过滤并关闭其广告/遥测接口；若仍出现，说明是别的东西打印的，请把原样输出发出来 |
+| 每次调用出现 `当前为免费版wxauto4 … 如需更多功能可查看plus版本` | 这是 wxauto4 免费版自带的推广横幅。本 skill 用 `ads=False` 从源头关掉它，并额外过滤推广文本；若仍出现，请把原样输出发出来 |
 | 想要更少的输出 | 加 `-q/--quiet`，成功时只打印一行 `完成: …` |
 | 中文乱码（Windows） | 脚本已强制 UTF-8；仍异常时在 `cmd` 执行 `chcp 65001` |
 
@@ -328,8 +440,10 @@ macOS 端的两点差异：好友身份无法像 Windows 那样二次确认；`-
 8. macOS 键盘模式（微信 4.1.x 默认路径）**没有任何校验**：`Esc` → `Cmd+F` → 粘贴名称 → 回车，
    如果名称在微信里查不到，微信不会打开会话，随后粘贴的文件/文字会发给**当前已打开的那个会话**。
    因此键盘模式下务必核对 `--to`，或直接用默认的「文件传输助手」。
-9. **测试/高级环境变量**：`SEND_TO_FILEHELPER_BACKEND=windows|macos` 可强制后端，
+9. **测试/高级环境变量**：`SEND_TO_FILEHELPER_BACKEND=windows|macos` 可强制平台后端，
    `SEND_TO_FILEHELPER_SKIP_PLATFORM_CHECK=1` 可忽略平台检查（仅用于模拟/开发验证），
+   `SEND_TO_FILEHELPER_WX_BACKEND=free|plus` 可强制 Windows 自动化后端（默认 `auto`：装了 Plus
+   就用 Plus），`SEND_TO_FILEHELPER_SKIP_CLIENT_CHECK=1` 可跳过 Windows 客户端版本预检，
    `SEND_TO_FILEHELPER_NO_REOPEN=1` 可禁止脚本自动 `open -b` 重开微信主窗口，
    `SEND_TO_FILEHELPER_SHOW_ADS=1` / `SEND_TO_FILEHELPER_ALLOW_TELEMETRY=1` 可放行
    wxauto4 免费版的推广输出与遥测（默认关闭）。

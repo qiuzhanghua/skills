@@ -4,6 +4,16 @@
 # dependencies = [
 #     "click",
 #     "wxauto4; sys_platform == 'win32'",
+#     "pillow; sys_platform == 'win32'",
+#     "psutil; sys_platform == 'win32'",
+#     "pywin32; sys_platform == 'win32'",
+#     "winrt-Windows.Media.Ocr; sys_platform == 'win32'",
+#     "winrt-Windows.Globalization; sys_platform == 'win32'",
+#     "winrt-Windows.Graphics.Imaging; sys_platform == 'win32'",
+#     "winrt-Windows.Storage; sys_platform == 'win32'",
+#     "winrt-Windows.Storage.Streams; sys_platform == 'win32'",
+#     "winrt-Windows.Foundation; sys_platform == 'win32'",
+#     "winrt-Windows.Foundation.Collections; sys_platform == 'win32'",
 #     "pyobjc-framework-Cocoa; sys_platform == 'darwin'",
 #     "pyobjc-framework-Quartz; sys_platform == 'darwin'",
 #     "pyobjc-framework-ApplicationServices; sys_platform == 'darwin'",
@@ -31,7 +41,9 @@
 
 from __future__ import annotations
 
+import ctypes
 import glob
+import importlib
 import json
 import os
 import sys
@@ -41,6 +53,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import click
+
+if sys.platform == "win32":  # ctypes.wintypes 只在 Windows 上存在
+    from ctypes import wintypes
 
 DEFAULT_TARGET = "文件传输助手"
 DEFAULT_MAX_SIZE_MB = 100
@@ -52,18 +67,49 @@ FORCE_BACKEND_ENV = "SEND_TO_FILEHELPER_BACKEND"
 SHOW_ADS_ENV = "SEND_TO_FILEHELPER_SHOW_ADS"
 # 允许 wxauto4 上报遥测时设置
 ALLOW_TELEMETRY_ENV = "SEND_TO_FILEHELPER_ALLOW_TELEMETRY"
+# 强制选择免费版 / Plus 版：auto（默认，装了 Plus 就优先用）/ free / plus
+WX_BACKEND_ENV = "SEND_TO_FILEHELPER_WX_BACKEND"
+# 跳过 Windows 客户端预检（即使版本超出免费版上限也强行尝试）
+SKIP_CLIENT_CHECK_ENV = "SEND_TO_FILEHELPER_SKIP_CLIENT_CHECK"
 
-# wxauto4 免费版会打印的推广内容（命中即丢弃）
+# wxauto4 免费版官方兼容的微信客户端上限（见 docs.wxauto.org 安装文档）。
+# 比它更新的客户端不再向 UIA 暴露免费版需要的控件树，WeChat() 会抛
+# 「未找到已登录的客户端主窗口」——这不是登录/最小化问题，重试也没用。
+WXAUTO4_FREE_MAX_CLIENT = (4, 1, 8, 107)
+# 免费版可用客户端的官方版本归档
+WXAUTO4_FREE_CLIENT_URL = (
+    "https://github.com/SiverKing/wechat4.0-windows-versions/releases/tag/v4.1.8.107"
+)
+# Plus 版（wxautox4）安装与激活文档
+WXAUTO4_PLUS_DOCS_URL = "https://docs.wxauto.org/docs/install.html"
+
+# wxauto4 免费版会打印的推广内容（命中即丢弃）。
+# 注意只匹配推广专用的 URL 片段，不要用裸域名 wxauto.org：
+# 官方文档链接 docs.wxauto.org 会出现在本脚本自己的提示里。
 WXAUTO_AD_MARKERS = (
     "当前为免费版",
     "如需更多功能",
-    "wxauto.org",
+    "wxauto.org/purchase",
     "plus版本",
     "plus版",
     "Plus版",
+    "可取消输出该内容",
+    "如有打扰请见谅",
+    "work.weixin.qq.com/kfid",
 )
 
+# Windows 上正在运行的微信客户端进程名（4.x 为 Weixin.exe，3.x 为 WeChat.exe）
+WECHAT_CLIENT_EXES = ("weixin.exe", "wechat.exe")
+# 微信主窗口的顶层类名（4.x / 3.x）
+WECHAT_MAIN_WINDOW_CLASSES = ("Qt51514QWindowIcon", "WeChatMainWndForPC")
+# 托盘/登录窗口的类名特征：这些不是主窗口
+WECHAT_TRAY_MARKERS = ("WxTrayIcon", "WeChatLoginWnd")
+
 QUIET = False
+
+# 安装推广过滤器之前的原始流：本脚本自己的输出走它们，永不被过滤器吞掉
+_REAL_STDOUT = None
+_REAL_STDERR = None
 
 
 def set_quiet(enabled: bool) -> None:
@@ -102,22 +148,30 @@ def enable_utf8_output() -> None:
             pass
 
 
+def _own_stream(err: bool = False):
+    """本脚本自身输出所用的流（绕开推广过滤器）。"""
+    stream = _REAL_STDERR if err else _REAL_STDOUT
+    if stream is not None:
+        return stream
+    return sys.stderr if err else sys.stdout
+
+
 def info(message: str) -> None:
     if not QUIET:
-        click.secho(message, fg="cyan")
+        click.secho(message, fg="cyan", file=_own_stream())
 
 
 def ok(message: str) -> None:
     if not QUIET:
-        click.secho(message, fg="green")
+        click.secho(message, fg="green", file=_own_stream())
 
 
 def warn(message: str) -> None:
-    click.secho(message, fg="yellow", err=True)
+    click.secho(message, fg="yellow", file=_own_stream(err=True))
 
 
 def fail(message: str) -> None:
-    click.secho(f"错误: {message}", fg="red", err=True)
+    click.secho(f"错误: {message}", fg="red", file=_own_stream(err=True))
 
 
 class _AdFilterStream:
@@ -166,7 +220,16 @@ class _AdFilterStream:
 
 
 def silence_wxauto_ads() -> None:
-    """在 import wxauto4 之前安装过滤器（推广可能在 import 或实例化时打印）。"""
+    """在 import wxauto4 之前安装过滤器（推广可能在 import 或实例化时打印）。
+
+    同时记下原始流：本脚本自己的输出（info/ok/warn/fail）不经过过滤器，
+    否则提示里的 wxauto 官方链接会被当成推广一起吞掉。
+    """
+    global _REAL_STDOUT, _REAL_STDERR
+    if _REAL_STDOUT is None:
+        _REAL_STDOUT = sys.stdout
+    if _REAL_STDERR is None:
+        _REAL_STDERR = sys.stderr
     if os.environ.get(SHOW_ADS_ENV):
         return
     for name in ("stdout", "stderr"):
@@ -176,12 +239,17 @@ def silence_wxauto_ads() -> None:
         setattr(sys, name, _AdFilterStream(stream, WXAUTO_AD_MARKERS))
 
 
-def configure_wxauto_privacy() -> None:
-    """关掉 wxauto4 自带的远程广告接口与遥测上报（需要时可用环境变量放行）。"""
+def configure_wxauto_privacy(module_name: str = "wxauto4") -> None:
+    """关掉后端自带的远程广告接口与遥测上报（需要时可用环境变量放行）。
+
+    Args:
+        module_name: 实际使用的后端包名（``wxauto4`` 或 ``wxautox4``）。
+    """
     if os.environ.get(ALLOW_TELEMETRY_ENV):
         return
     try:
-        from wxauto4.param import WxParam  # type: ignore import-not-found
+        param_module = importlib.import_module(f"{module_name}.param")
+        WxParam = getattr(param_module, "WxParam")  # type: ignore import-not-found
     except Exception:
         return
     for attribute, value in (
@@ -320,33 +388,546 @@ def describe_result(result: object) -> Tuple[Optional[bool], str]:
 
 
 # --------------------------------------------------------------------------- #
-# 微信交互
+# Windows 客户端预检（纯 stdlib，不依赖后端，所以后端坏掉时也能给出结论）
 # --------------------------------------------------------------------------- #
-def import_wechat_class():
+SW_RESTORE = 9
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+# 只用到 c_uint32，保证 macOS 上也能定义（wintypes 只在 Windows 存在）
+class _VS_FIXEDFILEINFO(ctypes.Structure):
+    _fields_ = [
+        ("dwSignature", ctypes.c_uint32),
+        ("dwStrucVersion", ctypes.c_uint32),
+        ("dwFileVersionMS", ctypes.c_uint32),
+        ("dwFileVersionLS", ctypes.c_uint32),
+        ("dwProductVersionMS", ctypes.c_uint32),
+        ("dwProductVersionLS", ctypes.c_uint32),
+        ("dwFileFlagsMask", ctypes.c_uint32),
+        ("dwFileFlags", ctypes.c_uint32),
+        ("dwFileOS", ctypes.c_uint32),
+        ("dwFileType", ctypes.c_uint32),
+        ("dwFileSubtype", ctypes.c_uint32),
+        ("dwFileDateMS", ctypes.c_uint32),
+        ("dwFileDateLS", ctypes.c_uint32),
+    ]
+
+
+_USER32_TYPED = False
+
+
+def _user32():
+    """取 user32，并把用到的函数签名声明好（64 位下句柄必须是 HWND 而不是 int）。"""
+    global _USER32_TYPED
+    user32 = ctypes.windll.user32
+    if not _USER32_TYPED:
+        user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetClassNameW.restype = ctypes.c_int
+        user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetWindowTextW.restype = ctypes.c_int
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.IsIconic.restype = wintypes.BOOL
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.ShowWindow.restype = wintypes.BOOL
+        user32.GetWindowThreadProcessId.argtypes = [
+            wintypes.HWND,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        _USER32_TYPED = True
+    return user32
+
+
+def _process_image_path(pid: int) -> str:
+    """返回进程的可执行文件完整路径（拿不到就返回空串）。"""
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return ""
     try:
-        from wxauto4 import WeChat  # type: ignore import-not-found
-    except ImportError as exc:  # pragma: no cover - 依赖缺失
-        raise RuntimeError(
-            "未能导入 wxauto4。请确认在 Windows 上执行，并已用 uv 安装依赖："
-            "uv run scripts/send_to_filehelper.py --help"
-        ) from exc
-    return WeChat
+        size = wintypes.DWORD(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return buffer.value
+        return ""
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _window_facts(hwnd) -> Tuple[int, str, str, str, bool, bool]:
+    """返回 (pid, 进程路径, 类名, 标题, 是否可见, 是否最小化)。"""
+    user32 = _user32()
+    pid = wintypes.DWORD(0)
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+
+    class_buffer = ctypes.create_unicode_buffer(512)
+    user32.GetClassNameW(hwnd, class_buffer, 512)
+    title_buffer = ctypes.create_unicode_buffer(512)
+    user32.GetWindowTextW(hwnd, title_buffer, 512)
+
+    return (
+        int(pid.value),
+        _process_image_path(pid.value),
+        class_buffer.value,
+        title_buffer.value,
+        bool(user32.IsWindowVisible(hwnd)),
+        bool(user32.IsIconic(hwnd)),
+    )
+
+
+def _enumerate_top_level_windows() -> List[Tuple[int, int, str, str, str, bool, bool]]:
+    """枚举所有顶层窗口，返回 (hwnd, pid, 路径, 类名, 标题, 可见, 最小化)。"""
+    user32 = _user32()
+    results: List[Tuple[int, int, str, str, str, bool, bool]] = []
+    enum_proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def _callback(hwnd, _lparam):
+        try:
+            pid, exe_path, class_name, title, visible, minimized = _window_facts(hwnd)
+            results.append(
+                (int(hwnd), pid, exe_path, class_name, title, visible, minimized)
+            )
+        except Exception:
+            pass
+        return True
+
+    user32.EnumWindows(enum_proc_type(_callback), 0)
+    return results
+
+
+def file_version_tuple(path: str) -> Optional[Tuple[int, int, int, int]]:
+    """读取可执行文件的版本资源，返回 (major, minor, build, revision)。"""
+    if sys.platform != "win32" or not path:
+        return None
+    try:
+        version = ctypes.windll.version
+        size = version.GetFileVersionInfoSizeW(path, None)
+        if not size:
+            return None
+        buffer = ctypes.create_string_buffer(size)
+        if not version.GetFileVersionInfoW(path, 0, size, buffer):
+            return None
+        pointer = ctypes.c_void_p()
+        length = wintypes.UINT()
+        if not version.VerQueryValueW(
+            buffer, "\\", ctypes.byref(pointer), ctypes.byref(length)
+        ):
+            return None
+        info = ctypes.cast(pointer, ctypes.POINTER(_VS_FIXEDFILEINFO)).contents
+        return (
+            info.dwFileVersionMS >> 16,
+            info.dwFileVersionMS & 0xFFFF,
+            info.dwFileVersionLS >> 16,
+            info.dwFileVersionLS & 0xFFFF,
+        )
+    except Exception:
+        return None
+
+
+def format_version(version: Optional[Sequence[int]]) -> str:
+    if not version:
+        return "未知"
+    return ".".join(str(part) for part in version)
+
+
+@dataclass
+class ClientWindow:
+    hwnd: int
+    class_name: str
+    title: str
+    visible: bool
+    minimized: bool
+
+    @property
+    def is_main_candidate(self) -> bool:
+        return self.class_name in WECHAT_MAIN_WINDOW_CLASSES and self.visible
+
+    @property
+    def is_tray(self) -> bool:
+        return any(marker in self.class_name for marker in WECHAT_TRAY_MARKERS)
+
+    def describe(self) -> str:
+        state = []
+        if self.minimized:
+            state.append("最小化")
+        elif not self.visible:
+            state.append("不可见")
+        suffix = f"（{'、'.join(state)}）" if state else ""
+        return f"{self.class_name} {self.title!r}{suffix}"
+
+
+@dataclass
+class WindowsClient:
+    pid: int
+    exe_path: str
+    windows: List[ClientWindow] = field(default_factory=list)
+
+    @property
+    def exe_name(self) -> str:
+        return os.path.basename(self.exe_path) or "?"
+
+    @property
+    def version(self) -> Optional[Tuple[int, int, int, int]]:
+        return file_version_tuple(self.exe_path)
+
+    @property
+    def main_window(self) -> Optional[ClientWindow]:
+        for window in self.windows:
+            if window.is_main_candidate:
+                return window
+        return None
+
+
+def find_windows_clients() -> List[WindowsClient]:
+    """找出正在运行的微信客户端进程，以及它们各自的顶层窗口。"""
+    clients: Dict[int, WindowsClient] = {}
+    for hwnd, pid, exe_path, class_name, title, visible, minimized in (
+        _enumerate_top_level_windows()
+    ):
+        if not exe_path:
+            continue
+        if os.path.basename(exe_path).lower() not in WECHAT_CLIENT_EXES:
+            continue
+        client = clients.get(pid)
+        if client is None:
+            client = WindowsClient(pid=pid, exe_path=exe_path)
+            clients[pid] = client
+        client.windows.append(
+            ClientWindow(
+                hwnd=hwnd,
+                class_name=class_name,
+                title=title,
+                visible=visible,
+                minimized=minimized,
+            )
+        )
+    return list(clients.values())
+
+
+def installed_client_paths() -> List[str]:
+    """微信没在运行时，尽力找出已安装的位置，让提示更具体。"""
+    paths: List[str] = []
+    if sys.platform == "win32":
+        try:
+            import winreg
+
+            locations = (
+                (winreg.HKEY_CURRENT_USER, r"Software\Tencent\Weixin"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Tencent\Weixin"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Tencent\Weixin"),
+                (winreg.HKEY_CURRENT_USER, r"Software\Tencent\WeChat"),
+            )
+            for root, sub_key in locations:
+                try:
+                    with winreg.OpenKey(root, sub_key) as key:
+                        install_path, _ = winreg.QueryValueEx(key, "InstallPath")
+                except OSError:
+                    continue
+                for exe_name in ("Weixin.exe", "WeChat.exe"):
+                    candidate = os.path.join(str(install_path), exe_name)
+                    if os.path.isfile(candidate):
+                        paths.append(candidate)
+        except Exception:
+            pass
+
+    for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
+        if not base:
+            continue
+        for relative in (r"Tencent\Weixin\Weixin.exe", r"Tencent\WeChat\WeChat.exe"):
+            candidate = os.path.join(base, relative)
+            if os.path.isfile(candidate):
+                paths.append(candidate)
+
+    unique: List[str] = []
+    for path in paths:
+        if path not in unique:
+            unique.append(path)
+    return unique
+
+
+def restore_window(hwnd: int) -> bool:
+    try:
+        _user32().ShowWindow(wintypes.HWND(hwnd), SW_RESTORE)
+        return True
+    except Exception:
+        return False
+
+
+def free_backend_version_problem(version: Optional[Sequence[int]]) -> Optional[str]:
+    """免费版 + 客户端版本超范围时，返回可直接展示的结论；否则返回 None。"""
+    if version is None:
+        return None
+    if tuple(version) <= WXAUTO4_FREE_MAX_CLIENT:
+        return None
+    supported = format_version(WXAUTO4_FREE_MAX_CLIENT)
+    return (
+        f"当前微信客户端版本 {format_version(version)} 超出了 wxauto4 免费版的官方兼容范围"
+        f"（免费版最高支持 {supported}）。\n"
+        "  因此后端找不到「已登录的客户端主窗口」——这不是登录、最小化或权限问题，"
+        "重试也不会成功。\n"
+        "解决办法（任选其一）：\n"
+        f"  1. 换用受支持的客户端 {supported}：\n"
+        f"     {WXAUTO4_FREE_CLIENT_URL}\n"
+        "  2. 使用官方 Plus 版（付费，跟随新版客户端更新），装好后本命令会自动优先使用它：\n"
+        "     uv run --with wxautox4 scripts/send_to_filehelper.py ...\n"
+        f"     激活: wxautox4 auth activate <激活码>   文档: {WXAUTO4_PLUS_DOCS_URL}\n"
+        f"  若确认要继续尝试（例如已切到 Plus 后端），设 {SKIP_CLIENT_CHECK_ENV}=1 跳过本检查。"
+    )
+
+
+def plus_license_dir_problem() -> Optional[str]:
+    """Plus 版授权目录不可写时给出提示（沙箱/受限环境的典型症状）。
+
+    wxautox4 把授权状态放在 ``~/.wxautox``；该目录不可写时它读不到授权，
+    只会报「未授权设备」，看起来像没激活过。
+    """
+    directory = Path.home() / ".wxautox"
+    if not directory.is_dir():
+        return None
+    probe = directory / f".send-to-filehelper-probe-{os.getpid()}"
+    try:
+        probe.write_text("probe", encoding="utf-8")
+    except OSError:
+        return (
+            f"Plus 版的授权目录不可写: {directory}\n"
+            "  当前进程很可能运行在沙箱/受限环境里：wxautox4 读不到授权状态，"
+            "会报「未授权设备」（即使已经激活成功过）。\n"
+            "  请在普通终端（不要经过沙箱包装）里重新运行本命令。"
+        )
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+    return None
+
+
+def windows_client_preflight(backend: "WxBackend") -> Tuple[List[str], Optional[str]]:
+    """检查 Windows 微信客户端状态。
+
+    Returns:
+        (notes, blocked): 需要回显的信息行；blocked 不为 None 时表示应中止发送。
+    """
+    notes: List[str] = []
+    clients = find_windows_clients()
+
+    if not clients:
+        installed = installed_client_paths()
+        location = f"（检测到安装位置: {installed[0]}）" if installed else ""
+        return notes, (
+            f"没有检测到正在运行的微信客户端{location}。\n"
+            "  请先启动并登录 Windows 版微信，并保持主窗口打开（不要只留在托盘）。"
+        )
+
+    # 优先挑真正有主窗口的那个进程
+    client = next((item for item in clients if item.main_window), clients[0])
+    version = client.version
+    normalized = tuple(version) if version else None
+
+    notes.append(
+        f"微信客户端: {client.exe_path}"
+        f"（版本 {format_version(version)}，进程 {client.exe_name} pid={client.pid}）"
+    )
+
+    main_window = client.main_window
+    if main_window is None:
+        states = "、".join(window.describe() for window in client.windows) or "无"
+        return notes, (
+            "微信在运行，但没有找到可见的主窗口（可能关进了托盘/系统栏）。\n"
+            "  请点开微信主窗口后重试。\n"
+            f"  当前进程的顶层窗口: {states}"
+        )
+
+    notes.append(f"主窗口: {main_window.describe()}")
+
+    if main_window.minimized:
+        if restore_window(main_window.hwnd):
+            notes.append("主窗口此前是最小化的，已自动还原。")
+        else:
+            notes.append("主窗口处于最小化状态（自动还原失败，请手动展开）。")
+
+    if backend.kind == "own":
+        # 自研后端不使用客户端的 UIA 控件树，因此不受"免费版客户端版本上限"约束，
+        # 也不需要 Plus 授权；上面这些客户端信息只作为诊断输出。
+        return notes, None
+
+    if backend.is_plus:
+        license_problem = plus_license_dir_problem()
+        if license_problem:
+            return notes, license_problem
+        return notes, None
+
+    problem = free_backend_version_problem(normalized)
+    if problem:
+        return notes, problem
+    return notes, None
+
+
+# --------------------------------------------------------------------------- #
+# 后端选择与微信交互
+# --------------------------------------------------------------------------- #
+@dataclass
+class WxBackend:
+    """实际使用的微信自动化后端。"""
+
+    module_name: str
+    label: str
+    is_plus: bool
+    wechat_class: object
+    kind: str = "wxauto"     # wxauto（免费/Plus）| own（自研：窗口+键鼠+OCR）
+
+
+_BACKEND: Optional[WxBackend] = None
+
+
+def load_wx_backend() -> WxBackend:
+    """选择并导入后端：默认优先 Plus 版（wxautox4），没装则回落免费版。
+
+    Plus 版跟随新版微信客户端更新，免费版的客户端兼容上限明显更低，
+    所以「装了 Plus 就用 Plus」是最不容易失败的顺序。
+    可用 ``SEND_TO_FILEHELPER_WX_BACKEND=free|plus|own`` 强制指定；
+    ``own`` 是自研后端（不使用微信的 UIA 控件树，见 wechat_win.py）。
+    """
+    global _BACKEND
+    if _BACKEND is not None:
+        return _BACKEND
+
+    # 必须在 import 后端之前装好推广过滤与原始流记录：
+    # 免费版在 import / 构造时都可能打印推广。
+    silence_wxauto_ads()
+
+    forced = os.environ.get(WX_BACKEND_ENV, "auto").strip().lower()
+
+    if forced in ("own", "self", "builtin"):
+        try:
+            from wechat_win import WinWeChat  # type: ignore import-not-found
+        except ImportError as exc:
+            raise RuntimeError(
+                f"未能导入自研后端 wechat_win（{exc}）。请在 skill 目录下运行，"
+                "并确认 scripts/wechat_win.py 存在。"
+            ) from exc
+        _BACKEND = WxBackend("wechat_win", "自研（窗口+键鼠+OCR）", False, WinWeChat, "own")
+        return _BACKEND
+
+    candidates = [
+        ("wxautox4", "wxautox4（Plus 版）", True),
+        ("wxauto4", "wxauto4（免费版）", False),
+    ]
+    if forced in ("free", "wxauto4"):
+        candidates = [candidates[1]]
+    elif forced in ("plus", "wxautox4"):
+        candidates = [candidates[0]]
+
+    problems: List[str] = []
+    for module_name, label, is_plus in candidates:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:  # 未安装 / 激活失败等
+            problems.append(f"{label}: {type(exc).__name__}: {exc}")
+            continue
+        wechat_class = getattr(module, "WeChat", None)
+        if wechat_class is None:
+            problems.append(f"{label}: 模块中没有 WeChat")
+            continue
+        _BACKEND = WxBackend(module_name, label, is_plus, wechat_class)
+        return _BACKEND
+
+    detail = "".join(f"  - {item}\n" for item in problems)
+    raise RuntimeError(
+        "未能导入微信自动化后端。请确认在 Windows 上执行，并已安装依赖：\n"
+        "  免费版：uv run scripts/send_to_filehelper.py --help\n"
+        "  Plus 版：uv run --with wxautox4 scripts/send_to_filehelper.py ...\n"
+        f"尝试过的后端：\n{detail}"
+    )
+
+
+def _construct_client(backend: WxBackend):
+    """构造客户端。
+
+    ``ads=False`` 关闭 wxauto4 免费版打印的推广横幅；该横幅由编译后的扩展
+    直接写底层 stdout，Python 层的过滤器拦不住，只有这个开关有效。
+    旧版本不认识这个参数时退回无参调用。自研后端不需要该参数。
+    """
+    if backend.kind == "own":
+        return backend.wechat_class()
+    try:
+        return backend.wechat_class(ads=False)
+    except TypeError:
+        return backend.wechat_class()
+
+
+def _connect_error_message(exc: object, backend: WxBackend) -> str:
+    if isinstance(exc, SystemExit):
+        # Plus 版未激活时会直接 sys.exit()，其退出码本身没有信息量
+        text = f"后端直接退出（退出码 {exc.code}）"
+    else:
+        text = str(exc)
+    lines = [
+        "无法连接微信 PC 客户端。请确认：",
+        f"  1. 已安装并登录 Windows 版微信（当前后端: {backend.label}）；",
+        "  2. 微信主窗口已打开且未最小化到托盘；",
+        "  3. 当前会话已解锁（远程桌面断开会话会导致 UI Automation 取不到控件）。",
+    ]
+
+    hints: List[str] = []
+    if backend.is_plus:
+        hints.append(
+            "Plus 版需要先激活: wxautox4 auth activate <激活码>"
+            f"（文档: {WXAUTO4_PLUS_DOCS_URL}）；"
+            "若在沙箱/受限环境里运行，授权状态读不到，也会表现为未激活"
+        )
+    if "未找到已登录的客户端主窗口" in text:
+        hints.append(
+            "该报错表示后端拿不到微信的 UIA 控件树（mmui::*），通常是客户端版本不受支持："
+            f"免费版官方上限 {format_version(WXAUTO4_FREE_MAX_CLIENT)}；"
+            "实测客户端 4.1.12.55 连 Plus 版也找不到主窗口。\n"
+            f"     请换用受支持的客户端: {WXAUTO4_FREE_CLIENT_URL}"
+        )
+    for index, hint in enumerate(hints, start=4):
+        lines.append(f"  {index}. {hint}")
+
+    lines.append(f"原始错误: {text}")
+    return "\n".join(lines)
 
 
 def open_wechat():
     silence_wxauto_ads()
-    WeChat = import_wechat_class()
-    configure_wxauto_privacy()
+    backend = load_wx_backend()
+    if backend.kind != "own":
+        configure_wxauto_privacy(backend.module_name)
+
+    if sys.platform == "win32":
+        if os.environ.get(SKIP_CLIENT_CHECK_ENV):
+            info(f"已跳过客户端预检（{SKIP_CLIENT_CHECK_ENV} 已设置）")
+        else:
+            # 预检要在构造客户端之前做完：客户端版本不受支持时，
+            # WeChat() 会白等约 120 秒再抛一个误导性的错误。
+            notes, blocked = windows_client_preflight(backend)
+            for line in notes:
+                info(line)
+            if blocked:
+                raise RuntimeError(blocked)
+
     try:
-        return WeChat()
-    except Exception as exc:  # wxauto4 在未登录/未启动时抛异常
-        raise RuntimeError(
-            "无法连接微信 PC 客户端。请确认：\n"
-            "  1. 已安装并登录 Windows 版微信 4.x（wxauto4 免费版适配 4.1.x）；\n"
-            "  2. 微信主窗口已打开且未最小化到托盘；\n"
-            "  3. 当前会话已解锁（远程桌面断开会话会导致 UI Automation 取不到控件）。\n"
-            f"原始错误: {exc}"
-        ) from exc
+        return _construct_client(backend)
+    except KeyboardInterrupt:
+        raise
+    except (Exception, SystemExit) as exc:
+        # 未登录 / 未启动 / 版本不兼容都会走到这里；
+        # Plus 版未激活时是直接 sys.exit()，所以 SystemExit 也要接住。
+        raise RuntimeError(_connect_error_message(exc, backend)) from exc
 
 
 def switch_to(wx, target: str, exact: bool) -> Dict[str, str]:
@@ -461,6 +1042,7 @@ def verify_sent(
         (confirmed, missing, note): 已确认项、未确认项、不可用原因。
         条目既可能是文件名，也可能是 ``文本: 摘要``。
     """
+    backend_note = getattr(wx, "verify_note", None)
     try:
         messages = wx.GetAllMessage() or []
     except Exception as exc:
@@ -485,10 +1067,17 @@ def verify_sent(
         )
         (confirmed if hit else missing).append(path.name)
     for text in texts:
-        needle = text.strip()
-        hit = bool(needle) and any(needle in content for content in text_haystack)
+        # 用「去掉所有空白」做比对：OCR / 客户端回显都可能在中文与标点之间插空格
+        flat_needle = "".join(text.split())
+        hit = bool(flat_needle) and any(
+            flat_needle in "".join(content.split()) for content in text_haystack
+        )
         label = _text_label(text)
         (confirmed if hit else missing).append(label)
+    if backend_note and not confirmed:
+        # 自研后端（--wx-backend own）的复核依赖 OCR，读不到新消息是常态而不是失败；
+        # 返回 note 让上层只提示、不判失败（消息其实已经发出）。
+        return [], [], backend_note
     return confirmed, missing, None
 
 
@@ -792,7 +1381,14 @@ def check_environment(debug: bool = False) -> int:
     problems: List[str] = []
 
     if platform == "win32":
-        info("平台: Windows（后端: wxauto4 / UI Automation）")
+        info("平台: Windows（后端: 微信 UI Automation）")
+        try:
+            backend = load_wx_backend()
+        except RuntimeError as exc:
+            fail(str(exc))
+            return 1
+        info(f"自动化后端: {backend.label}")
+
         try:
             wx = open_wechat()
         except RuntimeError as exc:
@@ -803,13 +1399,14 @@ def check_environment(debug: bool = False) -> int:
         except Exception as exc:
             fail(f"读取当前会话信息失败: {exc}")
             return 1
-        ok("wxauto4 可用")
+        ok(f"{backend.label} 可用")
         ok(f"当前会话: {chat_info.get('chat_name') or '未知'}")
         try:
-            from wxauto4 import __version__ as wxauto_version  # type: ignore
+            module = importlib.import_module(backend.module_name)
+            version = getattr(module, "__version__", None)
 
-            if wxauto_version:
-                info(f"wxauto4 版本: {wxauto_version}")
+            if version:
+                info(f"{backend.module_name} 版本: {version}")
         except Exception:
             pass
         return 0
@@ -1026,6 +1623,15 @@ def check_environment(debug: bool = False) -> int:
     help="macOS 输入方式：auto 自动选择；ax 只用辅助功能；keystrokes 只用键盘（Windows 忽略）。",
 )
 @click.option(
+    "--wx-backend",
+    "wx_backend",
+    type=click.Choice(["auto", "free", "plus", "own"]),
+    default="auto",
+    show_default=True,
+    help="Windows 后端：auto 自动（优先 Plus）/ free=wxauto4 / plus=wxautox4 / "
+         "own=自研（窗口+键鼠+OCR，不依赖微信 UIA 控件树）。",
+)
+@click.option(
     "-q",
     "--quiet",
     is_flag=True,
@@ -1058,6 +1664,7 @@ def main(
     dry_run: bool,
     check_only: bool,
     input_mode: str,
+    wx_backend: str,
     quiet: bool,
     debug: bool,
     as_json: bool,
@@ -1065,6 +1672,8 @@ def main(
     """把本地文件 / 文本发送到微信文件传输助手或指定会话（Windows / macOS）。"""
     enable_utf8_output()
     set_quiet(quiet)
+    if wx_backend and wx_backend != "auto":
+        os.environ[WX_BACKEND_ENV] = wx_backend
 
     if check_only:
         sys.exit(check_environment(debug=debug))
