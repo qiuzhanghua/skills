@@ -1104,6 +1104,7 @@ def run_windows_backend(
     delay: float,
     retries: int,
     no_verify: bool,
+    blind: bool = False,
     texts: Sequence[str] = (),
     after_texts: Sequence[str] = (),
     switch: bool = True,
@@ -1115,6 +1116,18 @@ def run_windows_backend(
     except RuntimeError as exc:
         report.abort = str(exc)
         return report
+
+    # 自研后端把校验做在 SendMsg 内部，必须穿透进去才省得掉那些等待。
+    # 用属性而不是关键字：wxauto4/wxautox4 的 SendMsg 签名不认 verify，传了会 TypeError。
+    #   --no-verify -> 只跳过发送后的结果复核
+    #   --blind     -> 盲发：连发送前的输入框确认也跳过（并隐含 --no-verify）
+    # 会话识别与硬校验（防发错人）两者都不受影响。
+    if blind:
+        no_verify = True
+    if hasattr(wx, "skip_verify"):
+        wx.skip_verify = no_verify
+    if hasattr(wx, "skip_input_check"):
+        wx.skip_input_check = blind
 
     chat_name = str(chat_info.get("chat_name") or "")
     if not chat_matches(chat_name, target, exact):
@@ -1603,6 +1616,12 @@ def check_environment(debug: bool = False) -> int:
     help="跳过发送后的消息校验。",
 )
 @click.option(
+    "--blind",
+    is_flag=True,
+    default=False,
+    help="盲发：连发送前的输入框确认也跳过（隐含 --no-verify）。仅自研后端生效。",
+)
+@click.option(
     "--dry-run",
     is_flag=True,
     default=False,
@@ -1661,6 +1680,7 @@ def main(
     max_size_mb: float,
     retries: int,
     no_verify: bool,
+    blind: bool,
     dry_run: bool,
     check_only: bool,
     input_mode: str,
@@ -1745,6 +1765,11 @@ def main(
         )
         sys.exit(1)
 
+    # --blind 只对 Windows 自研后端生效。命令层的"汇总 / 退出码"判断必须自己同步：
+    # run_windows_backend 内部对 no_verify 的赋值是那个函数的局部变量、传不出来，
+    # 不同步的话"发送成功但未做校验"会被后面的失败判定误判成失败并以 1 退出。
+    verify_off = no_verify or (blind and platform == "win32")
+
     if platform == "darwin":
         report = run_macos_backend(
             resolved,
@@ -1771,6 +1796,7 @@ def main(
             delay,
             retries,
             no_verify,
+            blind=blind,
             texts=texts,
             after_texts=after_texts,
             switch=not no_switch,
@@ -1792,7 +1818,7 @@ def main(
         if texts or after_texts:
             sent_texts = len(report.messages)
             info(f"文本消息 : {sent_texts}/{len(texts) + len(after_texts)} 条")
-        if not no_verify:
+        if not verify_off:
             if report.verify_note:
                 warn(f"消息校验：{report.verify_note}")
             if report.unconfirmed:
@@ -1817,7 +1843,7 @@ def main(
     if report.errors:
         sys.exit(1)
     # 会话消息里一个都没看到 → 视为失败（除非用户主动关闭校验）
-    if not no_verify and not report.verify_note and not report.confirmed:
+    if not verify_off and not report.verify_note and not report.confirmed:
         fail("发送后未在会话中发现任何内容，请检查微信窗口状态。")
         sys.exit(1)
 

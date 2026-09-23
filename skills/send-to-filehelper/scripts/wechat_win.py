@@ -263,14 +263,75 @@ def _normalize_ocr_text(text: str) -> str:
     return re.sub(rf"(?<=[{cjk}])\s+(?=[{cjk}])", "", text).strip()
 
 
+# OCR 会把同一个标点读成不同形态（实测 ``【`` -> ``〖``/``〔``、``】`` -> ``〕``）。
+# 全角 ``：`` ``，`` 之类 NFKC 能折成半角，但方块括号不在 NFKC 的兼容映射里，单独补。
+_PUNCT_FOLD = str.maketrans(
+    {
+        "【": "[", "〖": "[", "〔": "[", "〈": "[", "《": "[", "「": "[", "『": "[",
+        "】": "]", "〗": "]", "〕": "]", "〉": "]", "》": "]", "」": "]", "』": "]",
+        "、": ",", "・": ".", "·": ".", "…": ".", "～": "~", "－": "-", "—": "-",
+        "“": '"', "”": '"', "‘": "'", "’": "'",
+    }
+)
+
+
+def _match_key(text: str) -> str:
+    """把文字折叠成用于**比对**的规范形式（只用于比对，不用于展示）。
+
+    OCR 会把同一段文字读成不同形态，直接做子串比对必然漏判——实测把
+    ``【自动化测试 16:25:27】`` 读成 ``〖自动化测试 16 ： 25 ： 27 〕``：方块括号变体、
+    全角冒号、以及数字与标点之间插入的空格。
+
+    这里统一做三件事：
+
+      1. ``NFKC`` 折叠全角/半角（``：`` -> ``:``、``，`` -> ``,``、``（）`` -> ``()``）；
+      2. ``_PUNCT_FOLD`` 归并 NFKC 不管的方块括号等异体；
+      3. 去掉**所有**空白并转小写（OCR 常在任意位置插空格）。
+
+    于是 ``【a 16:25】`` 与 ``〖 a 16 ： 25 〕`` 会折叠成同一个 key。
+    """
+    import unicodedata
+
+    folded = unicodedata.normalize("NFKC", text).translate(_PUNCT_FOLD)
+    return "".join(folded.split()).lower()
+
+
+def _match_any(lines, key: str) -> bool:
+    """单行或"按阅读顺序拼成的全文"任一命中即算命中。
+
+    微信会把一条长消息折成多行，OCR 也逐行返回，只比单行的话长消息永远复核不到。
+    """
+    if any(key in _match_key(line.text) for line in lines):
+        return True
+    joined = "".join(line.text for line in sorted(lines, key=lambda ln: (ln.cy, ln.cx)))
+    return key in _match_key(joined)
+
+
 def _is_timestamp(text: str) -> bool:
     """判断 OCR 出来的一行是不是纯时间戳（如 ``10:38`` / ``昨天 19:52`` 里的时间部分）。"""
     core = "".join(text.split()).replace("：", ":").replace(":", "")
     return bool(core) and core.isdigit()
 
 
+def _restore_if_minimized(hwnd: int) -> bool:
+    """窗口最小化时先还原，返回是否真的还原过。
+
+    ``SetForegroundWindow`` / ``BringWindowToTop`` 都不会把最小化的窗口展开，而最小化
+    窗口的 ``GetWindowRect`` 约为 (-32000, -32000)：一旦它被当作截图原点，之后所有点击
+    都会算到屏幕之外。所以置前之前必须先还原。
+    """
+    try:
+        if not _user32().IsIconic(hwnd):
+            return False
+        _user32().ShowWindow(hwnd, SW_RESTORE)
+        time.sleep(0.6)
+        return True
+    except Exception:
+        return False
+
+
 def _force_foreground(hwnd: int) -> None:
-    """把微信窗口拉到最前。
+    """把微信窗口拉到最前（最小化时先还原）。
 
     微信聊天区是硬件渲染的，窗口被别的窗口盖住时 ``PrintWindow`` 往往抓到空白帧
     （表现为"读不到「发送」按钮"）。先按一下 Alt 解除 SetForegroundWindow 的限制，
@@ -279,6 +340,7 @@ def _force_foreground(hwnd: int) -> None:
     import win32api
     import win32gui
 
+    _restore_if_minimized(hwnd)
     VK_MENU = 0x12
     try:
         win32api.keybd_event(VK_MENU, 0, 0, 0)
@@ -370,16 +432,44 @@ def _capture(hwnd: int, from_screen: bool = False):
     return image, (left, top, width, height)
 
 
+def _virtual_screen_rect() -> Tuple[int, int, int, int]:
+    """整个虚拟桌面的 (left, top, right, bottom)。
+
+    用虚拟桌面而不是主屏尺寸：多显示器（含主屏左侧的副屏）下负坐标本来就是合法的。
+    """
+    u = ctypes.windll.user32
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN = 76, 77
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 78, 79
+    left = u.GetSystemMetrics(SM_XVIRTUALSCREEN)
+    top = u.GetSystemMetrics(SM_YVIRTUALSCREEN)
+    return (
+        left,
+        top,
+        left + u.GetSystemMetrics(SM_CXVIRTUALSCREEN),
+        top + u.GetSystemMetrics(SM_CYVIRTUALSCREEN),
+    )
+
+
 def _click(x: int, y: int) -> None:
+    """在屏幕坐标 (x, y) 处左键单击；坐标不在屏幕内就报错，**不再夹回屏幕**。
+
+    以前这里会把越界坐标夹进屏幕再点。窗口最小化时 ``GetWindowRect`` 约为
+    (-32000, -32000)，按它换算出的绝对坐标远在屏幕之外，于是被静默夹到屏幕角落点一下，
+    脚本还当成点成功了——表现出来就是"点击全都不对"。宁可报错让上层重新取帧，也不盲点。
+    """
+    xi, yi = int(x), int(y)
+    left, top, right, bottom = _virtual_screen_rect()
+    if not (left <= xi < right and top <= yi < bottom):
+        raise WeChatWindowsError(
+            f"点击坐标 ({xi}, {yi}) 不在屏幕范围 ({left}, {top})-({right}, {bottom}) 内；"
+            "微信窗口可能已最小化或被移出屏幕，已放弃本次点击以免点错位置。"
+        )
+
+    # 边界检查通过后才加载输入库：越界时先报错，不依赖 pywin32 是否可用
     import win32api
     import win32con
 
-    # 坐标必须落在屏幕内，否则 SetCursorPos 直接报错（分辨率变化时很容易越界）
-    screen_w = ctypes.windll.user32.GetSystemMetrics(0)
-    screen_h = ctypes.windll.user32.GetSystemMetrics(1)
-    x = max(0, min(int(x), screen_w - 2))
-    y = max(0, min(int(y), screen_h - 2))
-    win32api.SetCursorPos((x, y))
+    win32api.SetCursorPos((xi, yi))
     time.sleep(0.25)
     win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
     time.sleep(0.08)
@@ -437,6 +527,11 @@ class WinWeChat:
         # 这种情况下**不判失败**（消息其实已经发出），只把这个说明交给上层展示。
         self.verify_note: Optional[str] = None
         self.best_effort_verify = True
+        # 由 send_to_filehelper.py 设置（客户端认错字时两处校验都永远不可能通过）：
+        #   skip_verify      --no-verify：跳过**发送后**的结果复核
+        #   skip_input_check --blind     ：连**发送前**的输入框确认也跳过（盲发）
+        self.skip_verify = False
+        self.skip_input_check = False
         self.activate()
         if not ocr_available():
             raise WeChatWindowsError(
@@ -589,6 +684,52 @@ class WinWeChat:
     def _abs(self, x: int, y: int) -> Tuple[int, int]:
         return self._origin[0] + x, self._origin[1] + y
 
+    def _window_origin(self) -> Optional[Tuple[int, int]]:
+        """当前窗口左上角；窗口没了/取不到时返回 None。"""
+        import win32gui
+
+        try:
+            left, top, _, _ = win32gui.GetWindowRect(self.hwnd)
+        except Exception:
+            return None
+        return int(left), int(top)
+
+    def _ensure_clickable(self) -> bool:
+        """点击前确认窗口可见、未最小化，且位置与当前地标帧一致。
+
+        窗口最小化或被挪动后 ``self._origin`` 就作废了，继续按它换算绝对坐标会把点击
+        送到错误位置。这里先还原窗口；位置对不上就重新取帧，让地标与原点重新对齐。
+        返回 False 表示当前无法安全点击，调用方应当放弃本次点击。
+        """
+        u = _user32()
+
+        if _restore_if_minimized(self.hwnd):
+            _force_foreground(self.hwnd)
+            self.refresh()
+
+        try:
+            if not u.IsWindowVisible(self.hwnd) or u.IsIconic(self.hwnd):
+                return False
+        except Exception:
+            return False
+
+        if self._lines and self._window_origin() == self._origin:
+            return True
+
+        # 窗口被移动/还原过，或还没有任何地标帧：重新取一帧再核对
+        self.refresh()
+        return bool(self._lines) and self._window_origin() == self._origin
+
+    def _click_window(self, x: int, y: int) -> bool:
+        """点击窗口内相对坐标 (x, y)；返回 False 表示本次点击已被安全放弃。"""
+        if not self._ensure_clickable():
+            return False
+        try:
+            _click(*self._abs(x, y))
+        except WeChatWindowsError:
+            return False
+        return True
+
     def _send_button(self) -> Optional[OcrLine]:
         for line in self._lines:
             if line.flat() == "发送":
@@ -714,7 +855,11 @@ class WinWeChat:
                 f"会话列表里没有找到「{who}」。"
                 "请确认名称，或先把目标会话打开（可用 --no-switch）。"
             )
-        _click(*self._abs(target.x0 + 10, target.cy))
+        if not self._click_window(target.x0 + 10, target.cy):
+            raise WeChatWindowsError(
+                "微信窗口当前不可点击（可能刚被最小化或移出屏幕），已放弃切换会话。"
+                "请保持微信主窗口打开可见后重试。"
+            )
         time.sleep(1.2)
         # 点击后微信会重绘聊天区，缓存帧有时不完整；复核两次再下结论
         for attempt in range(3):
@@ -741,42 +886,71 @@ class WinWeChat:
         return self._toolbar_y() - int(self._size[1] * 0.28)
 
     def _input_contains(self, needle: str) -> bool:
-        """检查这段文字是不是**已经在输入框里**（回车前的关键确认）。"""
-        flat = "".join(needle.split()).lower()
-        if not flat:
+        """检查这段文字是不是**已经在输入框里**（回车前的关键确认）。
+
+        必须多轮 + 多帧：微信重绘是异步的，而 ``refresh()`` 一旦拿到「发送」与标题这两个
+        地标就会**立刻返回**——很可能返回的还是**粘贴之前**的旧帧，于是刚粘进去的文字读不到，
+        必然误报「未能确认文字进入输入框」。这里与 ``_text_present`` 同样取多帧并集并重试。
+        """
+        key = _match_key(needle)
+        if not key:
             return False
-        self.refresh()
-        input_top = self._input_box_top()
-        for line in self._lines:
-            if line.cy >= input_top and flat in line.flat():
+        # 轮数刻意压到 2：多轮重试会把「按下回车」推迟十几秒，而校验在客户端认错字时
+        # 本来就不可能通过，等待纯属浪费。多帧并集保留，用来兜住异步重绘。
+        for i in range(2):
+            if i:
+                _force_foreground(self.hwnd)
+                _nudge_repaint(self.hwnd)
+                time.sleep(0.5)
+            lines = self._lines_union(2)
+            input_top = self._input_box_top()
+            if _match_any([line for line in lines if line.cy >= input_top], key):
                 return True
         return False
 
     def SendMsg(self, text: str, **_: object) -> Dict[str, str]:
-        """发送文本：聚焦输入框 → 粘贴 → **确认文字进了输入框** → 回车。
+        """发送文本：聚焦输入框 → 粘贴**一次** → 确认 → 回车。
 
         合成键鼠只送给**前台窗口**，所以每一步之前都要确保微信在最前
         （机器上可能还开着第二个微信的登录窗口，很容易把焦点抢走）。
-        **只发一次**：校验失败时也绝不重发，否则会因误判而重复发消息。
+
+        **粘贴只做一次**。原实现每次重试都重新粘贴，而 OCR 复核在客户端认错字时
+        永远不通过，于是输入框被粘贴 2~3 遍、最后一次性发出，**消息内容成倍重复**
+        （实测同一条文字被发成 3 遍）。这里只在"点不到输入框"时重试粘贴——那种
+        情况下什么都没粘进去，重试是安全的；校验本身失败只在"看"上重试。
         """
-        entered = False
-        for attempt in range(3):
+        typed = False
+        for _ in range(3):
             _force_foreground(self.hwnd)
-            _click(*self._abs(*self._input_point()))
+            if not self._click_window(*self._input_point()):
+                time.sleep(0.5)
+                continue
             time.sleep(0.6)
             _set_clipboard_text(text)
             time.sleep(0.3)
             _key(VK_V, ctrl=True)
             time.sleep(0.9)
-            if self._input_contains(text):
-                entered = True
-                break
-            time.sleep(0.5)
+            typed = True
+            break
+
+        # 发送**前**的输入框确认：只有 --blind（盲发）才跳过，--no-verify 不跳过它。
+        if self.skip_input_check:
+            entered = typed
+        else:
+            entered = typed and self._input_contains(text)
 
         # 无论确认与否都按一次回车：确认失败也可能是截图滞后造成的误判，
         # 此时回车无害；若文本确实没进去，回车同样无害。
         _key(VK_RETURN)
         time.sleep(1.5)
+        # --no-verify 只跳过**发送后**的结果复核（_text_present + 上层 verify_sent）
+        if self.skip_verify:
+            self.verify_note = (
+                None
+                if entered
+                else "发送前未能确认文字进入输入框；已按 --no-verify 跳过发送后复核"
+            )
+            return {"status": "成功", "message": "已提交（已跳过发送后复核）"}
         if self._text_present(text):
             return {"status": "成功", "message": "已发送"}
         self.verify_note = (
@@ -814,17 +988,23 @@ class WinWeChat:
         # 重新取一次地标：窗口可能刚被最小化/还原或改过尺寸，旧坐标会点偏
         _force_foreground(self.hwnd)
         self.refresh()
-        toolbar_y = self._toolbar_y()
-        chat_left = self._session_left()
         # 「发送文件」是工具栏左起第 3 个图标，位置取决于聊天区左边界（而不是窗口宽度，
         # 也不是「发送」按钮）。先试最可能的位置（聊天区左边 +200px），再向两侧扩散；
         # 用"是否弹出文件选择对话框"来自我纠偏。
-        span = max(120, min(460, self._size[0] - chat_left - 60))
         offsets = [200, 232, 168, 264, 136, 296, 104, 328, 72, 360, 40, 392, 424]
-        candidates = [chat_left + d for d in offsets if 0 < d < span]
         dialog = None
-        for x in candidates:
-            _click(*self._abs(x, toolbar_y))
+        span = 0
+        tried = 0
+        for offset in offsets:
+            # 每次点击前重算地标：_click_window 可能因窗口刚被还原/移动而重新取帧
+            toolbar_y = self._toolbar_y()
+            chat_left = self._session_left()
+            span = max(120, min(460, self._size[0] - chat_left - 60))
+            if not 0 < offset < span:
+                continue
+            tried += 1
+            if not self._click_window(chat_left + offset, toolbar_y):
+                continue
             dialog = self._wait_dialog(timeout=1.4)
             if dialog:
                 break
@@ -833,7 +1013,7 @@ class WinWeChat:
         if not dialog:
             raise WeChatWindowsError(
                 "点了工具栏但没弹出文件选择对话框（「发送文件」按钮没命中）。"
-                f"已试过聊天区左边 +40…{span}px 共 {len(candidates)} 个位置。"
+                f"已试过聊天区左边 +40…{span}px 共 {tried} 个位置。"
             )
         self._fill_dialog(dialog, path)
         _key(VK_RETURN)          # 确认选择，关闭文件对话框
@@ -984,21 +1164,20 @@ class WinWeChat:
 
     def _text_present(self, needle: str) -> bool:
         """判断这段文字是否**已经发出**（出现在聊天区，而不是还躺在输入框里）。"""
-        flat = "".join(needle.split()).lower()
-        if not flat:
+        key = _match_key(needle)
+        if not key:
             return False
         input_top = self._input_box_top()
-        for i in range(4):
+        # 轮数压到 2：这条校验发生在**回车之后**，多轮重试就是"消息已经发出去了还在等"。
+        for i in range(2):
             if i:
                 _force_foreground(self.hwnd)
                 _nudge_repaint(self.hwnd)
-                time.sleep(1.0)
-            for line in self._lines_union(2):
-                # 忽略仍在输入框里的命中：那说明回车没生效，不能算发送成功
-                if line.cy >= input_top:
-                    continue
-                if flat in line.flat():
-                    return True
+                time.sleep(0.6)
+            # 忽略仍在输入框里的行：那说明回车没生效，不能算发送成功
+            lines = [line for line in self._lines_union(2) if line.cy < input_top]
+            if _match_any(lines, key):
+                return True
         return False
 
     def GetAllMessage(self) -> List[ChatMessage]:
