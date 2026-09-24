@@ -1,3 +1,24 @@
+#!uv run
+# /// script
+# requires-python = ">=3.10,<3.13"
+# dependencies = [
+#     "pillow",
+#     "psutil",
+#     "pywin32",
+#     "uiautomation",
+#     "winrt-Windows.Media.Ocr",
+#     "winrt-Windows.Globalization",
+#     "winrt-Windows.Graphics.Imaging",
+#     "winrt-Windows.Storage",
+#     "winrt-Windows.Storage.Streams",
+#     "winrt-Windows.Foundation",
+#     "winrt-Windows.Foundation.Collections",
+# ]
+#
+# [[tool.uv.index]]
+# url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+# default = true
+# ///
 """微信 Windows 端自研后端：窗口激活 + 剪贴板 + 合成键鼠 + OCR 地标定位。
 
 不依赖 wxauto4 / wxautox4，**也不依赖微信的 UIA 控件树**——微信 4.1.12.x 根本不向
@@ -11,11 +32,11 @@ UI Automation 发布界面控件（实测主窗口只有 2 个外壳节点），
 
 已知限制（实测结论）：
 
-  * **文本发送可用**（已端到端验证，消息真实到达）；
-  * **文件发送目前在微信 4.1.12.55 上无法完成**：文件对话框会被正常打开并"接受"，
-    拖放也能进入（显示「复制」光标），但微信始终不把文件挂到聊天输入框。同一台机器
-    上「剪贴板粘贴文件」「WM_DROPFILES」「真实 OLE 拖放」也都失败。因此本模块会对
-    文件发送做严格校验，失败时明确报错而不是假装成功。
+  * **文本发送可用**（端到端验证，消息真实到达）；
+  * **文件发送可用**：靠工具栏「发送文件」按钮打开系统文件对话框，写入完整路径并确认，
+    微信会把文件挂到聊天输入框；注意**附件挂上后 Enter 无法提交**，必须点界面上的
+    「发送」按钮（本模块已这样做）。若文件对话框被遮挡/最小化导致失败，请保持微信窗口
+    可见、不要抢占鼠标键盘。
   * OCR 需要 ``winrt`` 系列包（见 SKILL.md 依赖）；缺失时降级为「不做校验」并给出警告。
 """
 
@@ -50,6 +71,8 @@ KEYEVENTF_KEYUP = 0x0002
 FILE_BUTTON_OFFSET = -0.192
 # 主窗口最小宽度：用于排除微信为文件对话框创建的 131x65 同名属主窗口
 MIN_MAIN_WIDTH = 400
+# 会话名被截断显示时微信用省略号，但 OCR 对它的识别很不稳定（见过 @ “ "），都算
+_TRUNCATION_MARKS = ("…", "...", "・・・", "⋯", "@", "“", "”", "''", '"')
 
 
 class WeChatWindowsError(RuntimeError):
@@ -232,7 +255,7 @@ def ocr_image(image) -> List[OcrLine]:
 # --------------------------------------------------------------------------- #
 @dataclass
 class ChatMessage:
-    """与 wxauto4 的 Message 形状保持兼容（本后端只用 type/content）。"""
+    """一条聊天消息（本后端只用 type/content）。"""
 
     type: str
     content: str
@@ -514,7 +537,7 @@ def _release_modifiers() -> None:
 # 主后端
 # --------------------------------------------------------------------------- #
 class WinWeChat:
-    """自研 Windows 后端，接口与 wxauto4 的 ``WeChat`` 对齐（供 skill 直接使用）。"""
+    """自研 Windows RPA 后端（供 skill 的 ``send_to_filehelper.py`` 直接使用）。"""
 
     def __init__(self, target_hint: str = "") -> None:
         if sys.platform != "win32":
@@ -523,6 +546,8 @@ class WinWeChat:
         self._lines: List[OcrLine] = []
         self._size: Tuple[int, int] = (0, 0)
         self._origin: Tuple[int, int] = (0, 0)
+        # 最近一帧的截图：工具栏图标靠像素分析定位，比猜偏移稳
+        self._image = None
         # 自研后端的"发送后校验"依赖 OCR，而微信界面重绘是异步的，读不到新消息是常态。
         # 这种情况下**不判失败**（消息其实已经发出），只把这个说明交给上层展示。
         self.verify_note: Optional[str] = None
@@ -558,7 +583,8 @@ class WinWeChat:
                 if win32gui.GetClassName(hwnd) != MAIN_WINDOW_CLASS:
                     continue
                 name = _process_name(_window_pid(hwnd)).lower()
-                if not name.startswith(WECHAT_CLIENT_EXES[:2]):
+                # 读不到进程名（缺 psutil 等）时不要武断排除：类名已经足够窄了
+                if name and not name.startswith(WECHAT_CLIENT_EXES[:2]):
                     continue
                 left, top, right, bottom = win32gui.GetWindowRect(hwnd)
                 width, height = right - left, bottom - top
@@ -629,15 +655,27 @@ class WinWeChat:
             screen_h = ctypes.windll.user32.GetSystemMetrics(1)
             left, top, right, bottom = win32gui.GetWindowRect(self.hwnd)
             width, height = right - left, bottom - top
-            # 会话列表宽度固定（约 740px），聊天区太窄时微信不渲染工具栏，所以取宽一点
-            target_w = min(1600, max(760, int(screen_w * 0.88)))
+            # 目标尺寸必须**完整落在屏幕内**：屏幕分辨率会变（实测从 3840x2160 掉到
+            # 1536x864），窗口一旦比屏幕高，工具栏那一行就跑到屏幕外，所有点击都会被
+            # `_click` 的越界检查拒绝——表现出来就是"文件一直发不出去"。
+            # 同时不能太窄：会话列表是固定宽度，窗口窄了会话名会显示成「文件传...」，
+            # 发送前的会话校验就没法做（实测宽度 ≤1200 时连标题都读不出来）。
+            target_w = min(1800, max(1350, int(screen_w * 0.9)))
             target_h = min(1000, max(560, int(screen_h * 0.86)))
+            target_w = min(target_w, screen_w - 8)
+            target_h = min(target_h, screen_h - 8)
             off_screen = (
                 right > screen_w or bottom > screen_h or left < 0 or top < 0
             )
-            need = off_screen or width > screen_w - 20 or width < 720 or height < 520
+            need = (
+                off_screen
+                or width > screen_w - 20
+                or height > screen_h - 20
+                or width < 1300
+                or height < 560
+            )
             if need:
-                win32gui.MoveWindow(self.hwnd, 10, 10, target_w, target_h, True)
+                win32gui.MoveWindow(self.hwnd, 4, 4, target_w, target_h, True)
                 time.sleep(1.2)
                 _nudge_repaint(self.hwnd)
         except Exception:
@@ -651,6 +689,7 @@ class WinWeChat:
         """
         best_lines: Optional[List[OcrLine]] = None
         best_rect: Optional[Tuple[int, int, int, int]] = None
+        best_image = None
         best_score = -1
         for attempt in range(3):
             # 每轮都强制置前：微信窗口不在前台时 PrintWindow 会返回**旧帧**，
@@ -671,18 +710,79 @@ class WinWeChat:
                 # 优先"地标齐全"的帧，其次行数多；避免拿到微信重绘中途的半成品
                 score = (200 if has_send else 0) + (100 if has_title else 0) + min(len(lines), 90)
                 if score > best_score:
-                    best_score, best_lines, best_rect = score, lines, rect
+                    best_score, best_lines, best_rect, best_image = score, lines, rect, image
                 if has_send and has_title:
+                    self._image = image
                     return
             time.sleep(0.8)
         if best_lines is not None and best_rect is not None:
             self._lines = best_lines
             self._origin = (best_rect[0], best_rect[1])
             self._size = (best_rect[2], best_rect[3])
+            self._image = best_image
 
     # ---- 地标 ----
     def _abs(self, x: int, y: int) -> Tuple[int, int]:
         return self._origin[0] + x, self._origin[1] + y
+
+    def _toolbar_icons(self, band: int = 24) -> List[int]:
+        """用像素分析量出工具栏图标中心的窗口坐标 x（从左到右）。
+
+        以前是"猜偏移"（聊天区左边 +200/+259…），但**图标间距随窗口宽度变化**
+        （实测同一台机器上 +201 和 +259 都出现过），于是第一下经常先点到邻居图标——
+        用户看到的就是"每次都先去点发送收藏"。这里改成量：工具栏那一行图标是深色
+        字形、底色浅，按列的"墨量"切出一个个图标簇即可。
+
+        返回空列表表示这一帧不适合做像素分析，调用方退回偏移试探。
+        """
+        img = getattr(self, "_image", None)
+        if img is None:
+            return []
+        ty = self._toolbar_y()
+        x_start = self._session_left()
+        send = self._send_button()
+        x_end = (send.x0 - 24) if send is not None else (self._size[0] - 24)
+        top = max(0, ty - band)
+        bottom = min(self._size[1], ty + band)
+        if bottom - top < 8 or x_end - x_start < 60:
+            return []
+        try:
+            gray = img.crop((x_start, top, x_end, bottom)).convert("L")
+        except Exception:
+            return []
+        width, height = gray.size
+        pixels = gray.load()
+        ink = []
+        for x in range(width):
+            n = 0
+            for y in range(height):
+                if pixels[x, y] < 120:
+                    n += 1
+            ink.append(n)
+
+        clusters: List[Tuple[int, int]] = []
+        start = None
+        gap = 0
+        for x, n in enumerate(ink):
+            if n >= 2:
+                if start is None:
+                    start = x
+                gap = 0
+            elif start is not None:
+                gap += 1
+                if gap > 6:                 # 连续空白 = 图标边界
+                    clusters.append((start, x - gap))
+                    start = None
+                    gap = 0
+        if start is not None:
+            clusters.append((start, width - 1))
+
+        centers = [
+            x_start + (a + b) // 2
+            for a, b in clusters
+            if 8 <= (b - a) <= 70           # 图标宽度合理，排除噪点与细长滑块
+        ]
+        return centers
 
     def _window_origin(self) -> Optional[Tuple[int, int]]:
         """当前窗口左上角；窗口没了/取不到时返回 None。"""
@@ -706,6 +806,10 @@ class WinWeChat:
         if _restore_if_minimized(self.hwnd):
             _force_foreground(self.hwnd)
             self.refresh()
+        else:
+            # 屏幕分辨率会变。窗口一旦比屏幕大，工具栏就跑到屏幕外，之后所有点击都会被
+            # `_click` 的越界检查拒绝（表现为"文件一直发不出去"），所以点击前先把窗口收进屏幕。
+            self._ensure_usable_geometry()
 
         try:
             if not u.IsWindowVisible(self.hwnd) or u.IsIconic(self.hwnd):
@@ -731,10 +835,20 @@ class WinWeChat:
         return True
 
     def _send_button(self) -> Optional[OcrLine]:
+        """定位「发送」按钮。
+
+        OCR 会把这两个字认错（实测见过 ``发 法``），所以只要是以「发」开头的两三个字
+        就认——**认不出来会退化成比例估算，纵坐标能差近 20px，工具栏图标就点不中了**。
+        取最靠右、最靠下的那个候选（发送按钮在输入区右下角）。
+        """
+        candidates = []
         for line in self._lines:
-            if line.flat() == "发送":
-                return line
-        return None
+            flat = line.flat()
+            if flat == "发送" or (flat.startswith("发") and 1 < len(flat) <= 3):
+                candidates.append(line)
+        if not candidates:
+            return None
+        return max(candidates, key=lambda line: (line.cx, line.cy))
 
     def _session_left(self) -> int:
         """会话列表的右边界（= 聊天区左边界）。会话列表宽度是固定的，别用比例猜。"""
@@ -766,8 +880,7 @@ class WinWeChat:
         candidates = [
             line for line in self._lines
             if line.x0 > threshold
-            and line.cy < top_bound
-            and "搜索" not in line.flat()
+            and line.cy < top_bound            and "搜索" not in line.flat()
             and len(line.flat()) >= 2
             and not _is_timestamp(line.text)
         ]
@@ -808,9 +921,47 @@ class WinWeChat:
         return rows
 
     # ---- 对外能力 ----
+    @staticmethod
+    def _title_looks_truncated(line: OcrLine) -> bool:
+        """标题是不是被"截断显示"了。
+
+        窗口窄时微信会把会话名截成「文件传...」。OCR 对那个省略号的识别很不稳定，
+        实测见过认成 ``@``、``“``、``"``，所以这里按"结尾出现省略号类字符"来判断。
+        """
+        raw = line.text.rstrip()
+        if not raw:
+            return False
+        return any(raw.endswith(mark) for mark in _TRUNCATION_MARKS)
+
+    def _widen_for_title(self) -> bool:
+        """把窗口拉宽再重读标题：名字被截断只是**窗口太窄的显示问题**，不是会话不存在。"""
+        import win32gui
+
+        try:
+            screen_w = ctypes.windll.user32.GetSystemMetrics(0)
+            left, top, right, bottom = win32gui.GetWindowRect(self.hwnd)
+            width, height = right - left, bottom - top
+            target_w = min(1800, max(1350, screen_w - 20))
+            if target_w <= width + 60:
+                return False
+            win32gui.MoveWindow(self.hwnd, left, top, target_w, height, True)
+            time.sleep(1.2)
+            _nudge_repaint(self.hwnd)
+            self.refresh()
+            return True
+        except Exception:
+            return False
+
     def current_chat(self) -> str:
         self.refresh()
         title = self._chat_title()
+        # 两种情况都先试着把窗口拉宽再读一次：
+        #   1) 标题被截断显示成「文件传...」——名字只是显示不下，会话本身没问题；
+        #   2) 标题整行都读不到——窗口太窄时聊天区被挤没，标题根本不渲染。
+        # 拉宽不成功（窗口已经够宽）时 _widen_for_title 会直接返回 False，不浪费一次重读。
+        if title is None or self._title_looks_truncated(title):
+            if self._widen_for_title():
+                title = self._chat_title() or title
         return _normalize_ocr_text(title.text) if title else ""
 
     def ChatInfo(self) -> Dict[str, str]:
@@ -850,6 +1001,17 @@ class WinWeChat:
                 if want and want in row.flat():
                     target = row
                     break
+        if target is None:
+            # 再退一步：**会话行被截断显示**（列表窄时是「2028届1班家校通知…」）。
+            # 截断行是目标名的前缀，所以反过来判断"目标名以前缀开头"；为避免撞名，
+            # 只在唯一命中时才用它——而且它只负责"找到行"，真正的安全校验仍然是
+            # 点击之后的标题比对（标题被截断时 current_chat 会先拉宽窗口再读）。
+            prefixes = [
+                row for row in self._session_rows()
+                if len(row.flat()) >= 3 and want.startswith(row.flat())
+            ]
+            if len(prefixes) == 1:
+                target = prefixes[0]
         if target is None:
             raise WeChatWindowsError(
                 f"会话列表里没有找到「{who}」。"
@@ -984,40 +1146,91 @@ class WinWeChat:
             return {"status": "成功", "message": "已提交（未能 OCR 复核）"}
         return {"status": "成功", "message": "已发送"}
 
+    def _restore_main_window(self) -> bool:
+        """主窗口被最小化或被隐藏时把它弄回来；返回是否做过还原。
+
+        误点到工具栏的**截图**或**小程序**图标时，微信会把自己的主窗口藏起来/最小化
+        （截图会接管整个屏幕）。此时缓存的窗口原点和地标全部失效，后续点击都会落空，
+        表现为"发送失败"。所以每次试探之后都要检查并恢复一次。
+        """
+        u = _user32()
+        try:
+            hidden = not u.IsWindowVisible(self.hwnd)
+            minimized = bool(u.IsIconic(self.hwnd))
+        except Exception:
+            return False
+        if not (hidden or minimized):
+            return False
+        try:
+            _restore_if_minimized(self.hwnd)
+            if hidden:
+                u.ShowWindow(self.hwnd, SW_SHOW)
+            _force_foreground(self.hwnd)
+            time.sleep(0.6)
+            return True
+        except Exception:
+            return False
+
     def _send_one_file(self, path: str) -> None:
         # 重新取一次地标：窗口可能刚被最小化/还原或改过尺寸，旧坐标会点偏
         _force_foreground(self.hwnd)
+        self._restore_main_window()
         self.refresh()
-        # 「发送文件」是工具栏左起第 3 个图标，位置取决于聊天区左边界（而不是窗口宽度，
-        # 也不是「发送」按钮）。先试最可能的位置（聊天区左边 +200px），再向两侧扩散；
-        # 用"是否弹出文件选择对话框"来自我纠偏。
-        offsets = [200, 232, 168, 264, 136, 296, 104, 328, 72, 360, 40, 392, 424]
-        dialog = None
-        span = 0
-        tried = 0
-        for offset in offsets:
-            # 每次点击前重算地标：_click_window 可能因窗口刚被还原/移动而重新取帧
-            toolbar_y = self._toolbar_y()
+
+        def candidates() -> List[int]:
+            """给出要尝试的窗口内 x 坐标：**先量出来的图标，再退化为猜偏移。**
+
+            工具栏左起依次是 表情 / 收藏(小程序) / **发送文件** / 截图 / 语音 / 喇叭，
+            所以第 3 个图标就是目标。量不出来（像素分析失败）才用偏移兜底——
+            猜偏移会先点到邻居图标，用户看到的就是"每次都先去点发送收藏"。
+            """
+            icons = self._toolbar_icons()
+            ordered: List[int] = []
+            if len(icons) >= 3:
+                ordered.append(icons[2])                    # 量出来的「发送文件」
+                ordered.extend(x for i, x in enumerate(icons) if i != 2)
             chat_left = self._session_left()
             span = max(120, min(460, self._size[0] - chat_left - 60))
-            if not 0 < offset < span:
-                continue
+            offsets = [259, 200, 232, 300, 168, 336, 136, 376, 104, 416, 72, 456]
+            for off in offsets:
+                if 0 < off < span:
+                    ordered.append(chat_left + off)
+            # 去重保序
+            seen = set()
+            return [x for x in ordered if not (x in seen or seen.add(x))]
+
+        dialog = None
+        tried = 0
+        xs = candidates()
+        for index, x in enumerate(xs):
+            # 每次点击前重算 y：_click_window 可能因窗口刚被还原/移动而重新取帧
+            toolbar_y = self._toolbar_y()
             tried += 1
-            if not self._click_window(chat_left + offset, toolbar_y):
+            if not self._click_window(x, toolbar_y):
                 continue
             dialog = self._wait_dialog(timeout=1.4)
             if dialog:
                 break
-            _key(VK_ESCAPE)          # 关掉误开的表情/小程序等弹层
+            _key(VK_ESCAPE)          # 关掉误开的表情/收藏/小程序等弹层
             time.sleep(0.3)
+            # 误点到「截图」会接管屏幕并把主窗口藏起来，这里必须检查并恢复，
+            # 否则后面的候选位置全部按失效坐标点击，文件永远发不出去。
+            if self._restore_main_window():
+                self.refresh()
+                # 窗口动过之后，剩下的"量出来的图标"也可能失效，重算一次候选
+                rest = candidates()
+                xs = xs[: index + 1] + [c for c in rest if c not in xs[: index + 1]]
         if not dialog:
             raise WeChatWindowsError(
                 "点了工具栏但没弹出文件选择对话框（「发送文件」按钮没命中）。"
-                f"已试过聊天区左边 +40…{span}px 共 {tried} 个位置。"
+                f"已试过 {tried} 个位置（含像素分析量出的图标）。"
             )
         self._fill_dialog(dialog, path)
         _key(VK_RETURN)          # 确认选择，关闭文件对话框
         time.sleep(2.5)
+        # 关掉文件对话框后主窗口可能没回到前台（甚至被藏起来），先弄回来再提交附件
+        self._restore_main_window()
+        self.refresh()
         # 附件这时已经挂在输入框里（「发送」按钮变绿）。
         # 关键：**回车提交不了已挂的附件**（实测文件会一直停在输入框里等发送），
         # 必须点「发送」按钮。
@@ -1110,17 +1323,12 @@ class WinWeChat:
             except Exception:
                 pass
 
-        uia = None
-        for module_name in ("uiautomation", "wxauto4.uia"):
-            try:
-                import importlib
-
-                uia = importlib.import_module(module_name)
-                break
-            except Exception:
-                continue
-        if uia is None:
-            raise WeChatWindowsError("没有找到文件对话框的「文件名」输入框，且 UIA 不可用。")
+        try:
+            import uiautomation as uia
+        except Exception:
+            raise WeChatWindowsError(
+                "没有找到文件对话框的「文件名」输入框，且 uiautomation 不可用。"
+            ) from None
         control = uia.ControlFromHandle(dialog)
         stack = [control]
         edit = None
@@ -1203,3 +1411,81 @@ class WinWeChat:
 
     def message_texts(self) -> List[str]:
         return [m.content for m in self.GetAllMessage()]
+
+
+# --------------------------------------------------------------------------- #
+# 自检（排障用）
+# --------------------------------------------------------------------------- #
+def _dump(params) -> int:
+    """打印窗口信息与本后端依赖的全部 OCR 地标，用于定位"点偏了/找不到"。
+
+    只读：不会发送任何消息、不会点击任何按钮（``--activate`` 只把窗口置前）。
+    """
+    if not ocr_available():
+        print("OCR 不可用：缺少 winrt 系列包，本后端无法定位界面地标。")
+        print("请在 SKILL.md 的依赖列表里确认 winrt-Windows.* 已安装。")
+        return 1
+
+    try:
+        wx = WinWeChat()
+    except WeChatWindowsError as exc:
+        print(f"失败: {exc}")
+        return 1
+
+    if params.activate:
+        wx.activate()
+    wx.refresh()
+
+    print(f"主窗口 hwnd={wx.hwnd}  origin={wx._origin}  size={wx._size}")
+    if getattr(wx, "_image", None) is not None and params.shot:
+        try:
+            wx._image.save(params.shot)
+            print(f"窗口截图: {params.shot}")
+        except Exception as exc:
+            print(f"截图保存失败: {exc}")
+
+    chat = wx.current_chat()
+    print(f"当前聊天标题: {chat!r}")
+    print(f"会话栏左边界 x={wx._session_left()}")
+    print(f"输入框顶边 y={wx._input_box_top()}   输入点={wx._input_point()}")
+    send = wx._send_button()
+    print(
+        "「发送」按钮: "
+        + (f"({send.cx}, {send.cy}) 文本={send.text!r}" if send else "未识别（会按比例兜底）")
+    )
+
+    icons = wx._toolbar_icons()
+    print(f"工具栏图标 x（像素分析）: {icons}")
+    if len(icons) > 2:
+        point = wx._abs(icons[2], wx._toolbar_y())
+        print(f"「发送文件」按钮推算点击点: {point}")
+    else:
+        print("「发送文件」按钮: 像素分析未切出图标（会退回偏移试探）")
+
+    rows = wx._session_rows()
+    print(f"会话列表识别到 {len(rows)} 行:")
+    for row in rows[: params.limit]:
+        print(f"  ({row.cx}, {row.cy}) {row.text!r}")
+
+    if params.session:
+        try:
+            hit = wx.ChatWith(params.session, exact=False)
+        except Exception as exc:
+            print(f"切换会话失败: {exc}")
+            return 1
+        print(f"切换到 {params.session!r}: {'成功' if hit else '未命中'}")
+        print(f"切换后标题: {wx.current_chat()!r}")
+    return 0
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="自研 RPA 后端自检：打印主窗口与 OCR 地标（只读，不发送）"
+    )
+    parser.add_argument("--shot", metavar="PNG", help="把当前窗口截图存到该路径，便于人工核对")
+    parser.add_argument("--session", help="顺带测试切换到该会话（只读，不发送）")
+    parser.add_argument("--activate", action="store_true", help="先把微信主窗口置前")
+    parser.add_argument("--limit", type=int, default=10, help="最多打印多少行会话列表")
+    sys.exit(_dump(parser.parse_args()))

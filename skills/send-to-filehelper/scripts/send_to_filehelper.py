@@ -3,10 +3,10 @@
 # requires-python = ">=3.10,<3.13"
 # dependencies = [
 #     "click",
-#     "wxauto4; sys_platform == 'win32'",
 #     "pillow; sys_platform == 'win32'",
 #     "psutil; sys_platform == 'win32'",
 #     "pywin32; sys_platform == 'win32'",
+#     "uiautomation; sys_platform == 'win32'",
 #     "winrt-Windows.Media.Ocr; sys_platform == 'win32'",
 #     "winrt-Windows.Globalization; sys_platform == 'win32'",
 #     "winrt-Windows.Graphics.Imaging; sys_platform == 'win32'",
@@ -24,13 +24,15 @@
 # default = true
 # ///
 """
-微信文件发送器
+微信文件发送器（RPA 实现）
 
-把本地文件发送到微信「文件传输助手」或指定好友/群聊。两个平台后端：
-  - Windows：wxauto4（Windows UI Automation）
+把本地文件或文本发送到微信「文件传输助手」或指定好友/群聊。两个平台后端：
+  - Windows：自研 RPA 后端（窗口激活 + 合成键鼠 + 剪贴板 + Windows OCR，见 wechat_win.py）
   - macOS：Accessibility API（驱动微信 Mac 4.x 界面，见 wechat_mac.py）
 
-两者都只操作用户本人已登录的客户端界面，不做协议破解、不注入、不绕过限制。
+两个后端都是 **RPA（模拟人操作界面）**：只操作用户本人已登录、已打开的客户端界面，
+不做协议破解、不注入、不绕过限制。因此运行前微信必须打开并登录、主窗口保持可见；
+Windows 端建议先手动打开「文件传输助手」会话，运行期间不要动鼠标键盘。
 
 用法示例：
   uv run scripts/send_to_filehelper.py 报告.pdf
@@ -63,40 +65,10 @@ WILDCARD_CHARS = ("*", "?", "[")
 PLATFORM_ESCAPE_ENV = "SEND_TO_FILEHELPER_SKIP_PLATFORM_CHECK"
 # 仅用于测试/模拟：强制使用某个后端（windows / macos）
 FORCE_BACKEND_ENV = "SEND_TO_FILEHELPER_BACKEND"
-# 需要看 wxauto4 免费版原样输出（含推广）时设置
-SHOW_ADS_ENV = "SEND_TO_FILEHELPER_SHOW_ADS"
-# 允许 wxauto4 上报遥测时设置
-ALLOW_TELEMETRY_ENV = "SEND_TO_FILEHELPER_ALLOW_TELEMETRY"
-# 强制选择免费版 / Plus 版：auto（默认，装了 Plus 就优先用）/ free / plus
+# 强制选择 Windows 后端：auto（默认，等同 own）/ own（自研 RPA）
 WX_BACKEND_ENV = "SEND_TO_FILEHELPER_WX_BACKEND"
-# 跳过 Windows 客户端预检（即使版本超出免费版上限也强行尝试）
+# 跳过 Windows 客户端预检
 SKIP_CLIENT_CHECK_ENV = "SEND_TO_FILEHELPER_SKIP_CLIENT_CHECK"
-
-# wxauto4 免费版官方兼容的微信客户端上限（见 docs.wxauto.org 安装文档）。
-# 比它更新的客户端不再向 UIA 暴露免费版需要的控件树，WeChat() 会抛
-# 「未找到已登录的客户端主窗口」——这不是登录/最小化问题，重试也没用。
-WXAUTO4_FREE_MAX_CLIENT = (4, 1, 8, 107)
-# 免费版可用客户端的官方版本归档
-WXAUTO4_FREE_CLIENT_URL = (
-    "https://github.com/SiverKing/wechat4.0-windows-versions/releases/tag/v4.1.8.107"
-)
-# Plus 版（wxautox4）安装与激活文档
-WXAUTO4_PLUS_DOCS_URL = "https://docs.wxauto.org/docs/install.html"
-
-# wxauto4 免费版会打印的推广内容（命中即丢弃）。
-# 注意只匹配推广专用的 URL 片段，不要用裸域名 wxauto.org：
-# 官方文档链接 docs.wxauto.org 会出现在本脚本自己的提示里。
-WXAUTO_AD_MARKERS = (
-    "当前为免费版",
-    "如需更多功能",
-    "wxauto.org/purchase",
-    "plus版本",
-    "plus版",
-    "Plus版",
-    "可取消输出该内容",
-    "如有打扰请见谅",
-    "work.weixin.qq.com/kfid",
-)
 
 # Windows 上正在运行的微信客户端进程名（4.x 为 Weixin.exe，3.x 为 WeChat.exe）
 WECHAT_CLIENT_EXES = ("weixin.exe", "wechat.exe")
@@ -106,10 +78,6 @@ WECHAT_MAIN_WINDOW_CLASSES = ("Qt51514QWindowIcon", "WeChatMainWndForPC")
 WECHAT_TRAY_MARKERS = ("WxTrayIcon", "WeChatLoginWnd")
 
 QUIET = False
-
-# 安装推广过滤器之前的原始流：本脚本自己的输出走它们，永不被过滤器吞掉
-_REAL_STDOUT = None
-_REAL_STDERR = None
 
 
 def set_quiet(enabled: bool) -> None:
@@ -148,119 +116,22 @@ def enable_utf8_output() -> None:
             pass
 
 
-def _own_stream(err: bool = False):
-    """本脚本自身输出所用的流（绕开推广过滤器）。"""
-    stream = _REAL_STDERR if err else _REAL_STDOUT
-    if stream is not None:
-        return stream
-    return sys.stderr if err else sys.stdout
-
-
 def info(message: str) -> None:
     if not QUIET:
-        click.secho(message, fg="cyan", file=_own_stream())
+        click.secho(message, fg="cyan")
 
 
 def ok(message: str) -> None:
     if not QUIET:
-        click.secho(message, fg="green", file=_own_stream())
+        click.secho(message, fg="green")
 
 
 def warn(message: str) -> None:
-    click.secho(message, fg="yellow", file=_own_stream(err=True))
+    click.secho(message, fg="yellow", err=True)
 
 
 def fail(message: str) -> None:
-    click.secho(f"错误: {message}", fg="red", file=_own_stream(err=True))
-
-
-class _AdFilterStream:
-    """把 wxauto4 免费版打印的推广内容挡在终端之外。
-
-    只做逐次写入的整段匹配：包含推广标记的片段直接丢弃，其余原样透传，
-    因此不会缓冲、不会影响进度输出或其它第三方输出。
-    """
-
-    def __init__(self, stream, markers: Sequence[str]) -> None:
-        self._stream = stream
-        self._markers = markers
-        self._swallow_newline = False
-
-    def write(self, text) -> int:
-        # click 会先用 bytes 探测流，这里两种类型都要能处理
-        if isinstance(text, (bytes, bytearray)):
-            raw = bytes(text)
-            probe = raw.decode("utf-8", "ignore")
-        else:
-            raw = None
-            probe = text
-        if not probe:
-            return 0
-        if any(marker in probe for marker in self._markers):
-            # print() 会先写内容再单独写 "\n"，这里标记一下把随后的换行也吃掉
-            self._swallow_newline = True
-            return len(probe)
-        if self._swallow_newline:
-            self._swallow_newline = False
-            if not probe.strip():
-                return len(probe)
-        if raw is not None:
-            buffer = getattr(self._stream, "buffer", None)
-            if buffer is not None:
-                buffer.write(raw)
-                return len(raw)
-            return self._stream.write(probe)
-        return self._stream.write(text)
-
-    def flush(self) -> None:
-        self._stream.flush()
-
-    def __getattr__(self, item: str):
-        return getattr(self._stream, item)
-
-
-def silence_wxauto_ads() -> None:
-    """在 import wxauto4 之前安装过滤器（推广可能在 import 或实例化时打印）。
-
-    同时记下原始流：本脚本自己的输出（info/ok/warn/fail）不经过过滤器，
-    否则提示里的 wxauto 官方链接会被当成推广一起吞掉。
-    """
-    global _REAL_STDOUT, _REAL_STDERR
-    if _REAL_STDOUT is None:
-        _REAL_STDOUT = sys.stdout
-    if _REAL_STDERR is None:
-        _REAL_STDERR = sys.stderr
-    if os.environ.get(SHOW_ADS_ENV):
-        return
-    for name in ("stdout", "stderr"):
-        stream = getattr(sys, name, None)
-        if stream is None or isinstance(stream, _AdFilterStream):
-            continue
-        setattr(sys, name, _AdFilterStream(stream, WXAUTO_AD_MARKERS))
-
-
-def configure_wxauto_privacy(module_name: str = "wxauto4") -> None:
-    """关掉后端自带的远程广告接口与遥测上报（需要时可用环境变量放行）。
-
-    Args:
-        module_name: 实际使用的后端包名（``wxauto4`` 或 ``wxautox4``）。
-    """
-    if os.environ.get(ALLOW_TELEMETRY_ENV):
-        return
-    try:
-        param_module = importlib.import_module(f"{module_name}.param")
-        WxParam = getattr(param_module, "WxParam")  # type: ignore import-not-found
-    except Exception:
-        return
-    for attribute, value in (
-        ("TELEMETRY_ENABLED", False),
-        ("AD_API_URL", ""),
-        ("REPORT_API_URL", ""),
-    ):
-        try:
-            setattr(WxParam, attribute, value)
-        except Exception:
-            pass
+    click.secho(f"错误: {message}", fg="red", err=True)
 
 
 def human_size(num_bytes: float) -> str:
@@ -365,13 +236,13 @@ def check_sizes(files: Sequence[Path], max_size_mb: float) -> List[str]:
 
 
 # --------------------------------------------------------------------------- #
-# wxauto4 结果解析
+# 后端返回值解析
 # --------------------------------------------------------------------------- #
 def describe_result(result: object) -> Tuple[Optional[bool], str]:
-    """把 wxauto4 的返回值归一化为 (是否显式成功, 说明)。
+    """把后端 SendFiles/SendMsg 的返回值归一化为 (是否显式成功, 说明)。
 
-    wxauto4 各版本 SendFiles 的返回值不完全一致：
-    - WxResponse（dict 子类，含 status/message）：可见即按 status 判断；
+    取值形态不完全一致：
+    - dict（含 status/message）：可见即按 status 判断；
     - None：接口未返回结果，无法据此判定成败（交给消息校验）。
     """
     if result is None:
@@ -665,57 +536,8 @@ def restore_window(hwnd: int) -> bool:
         return False
 
 
-def free_backend_version_problem(version: Optional[Sequence[int]]) -> Optional[str]:
-    """免费版 + 客户端版本超范围时，返回可直接展示的结论；否则返回 None。"""
-    if version is None:
-        return None
-    if tuple(version) <= WXAUTO4_FREE_MAX_CLIENT:
-        return None
-    supported = format_version(WXAUTO4_FREE_MAX_CLIENT)
-    return (
-        f"当前微信客户端版本 {format_version(version)} 超出了 wxauto4 免费版的官方兼容范围"
-        f"（免费版最高支持 {supported}）。\n"
-        "  因此后端找不到「已登录的客户端主窗口」——这不是登录、最小化或权限问题，"
-        "重试也不会成功。\n"
-        "解决办法（任选其一）：\n"
-        f"  1. 换用受支持的客户端 {supported}：\n"
-        f"     {WXAUTO4_FREE_CLIENT_URL}\n"
-        "  2. 使用官方 Plus 版（付费，跟随新版客户端更新），装好后本命令会自动优先使用它：\n"
-        "     uv run --with wxautox4 scripts/send_to_filehelper.py ...\n"
-        f"     激活: wxautox4 auth activate <激活码>   文档: {WXAUTO4_PLUS_DOCS_URL}\n"
-        f"  若确认要继续尝试（例如已切到 Plus 后端），设 {SKIP_CLIENT_CHECK_ENV}=1 跳过本检查。"
-    )
-
-
-def plus_license_dir_problem() -> Optional[str]:
-    """Plus 版授权目录不可写时给出提示（沙箱/受限环境的典型症状）。
-
-    wxautox4 把授权状态放在 ``~/.wxautox``；该目录不可写时它读不到授权，
-    只会报「未授权设备」，看起来像没激活过。
-    """
-    directory = Path.home() / ".wxautox"
-    if not directory.is_dir():
-        return None
-    probe = directory / f".send-to-filehelper-probe-{os.getpid()}"
-    try:
-        probe.write_text("probe", encoding="utf-8")
-    except OSError:
-        return (
-            f"Plus 版的授权目录不可写: {directory}\n"
-            "  当前进程很可能运行在沙箱/受限环境里：wxautox4 读不到授权状态，"
-            "会报「未授权设备」（即使已经激活成功过）。\n"
-            "  请在普通终端（不要经过沙箱包装）里重新运行本命令。"
-        )
-    finally:
-        try:
-            probe.unlink()
-        except OSError:
-            pass
-    return None
-
-
-def windows_client_preflight(backend: "WxBackend") -> Tuple[List[str], Optional[str]]:
-    """检查 Windows 微信客户端状态。
+def windows_client_preflight() -> Tuple[List[str], Optional[str]]:
+    """检查 Windows 微信客户端状态（自研 RPA 后端的前置条件）。
 
     Returns:
         (notes, blocked): 需要回显的信息行；blocked 不为 None 时表示应中止发送。
@@ -734,7 +556,6 @@ def windows_client_preflight(backend: "WxBackend") -> Tuple[List[str], Optional[
     # 优先挑真正有主窗口的那个进程
     client = next((item for item in clients if item.main_window), clients[0])
     version = client.version
-    normalized = tuple(version) if version else None
 
     notes.append(
         f"微信客户端: {client.exe_path}"
@@ -758,20 +579,9 @@ def windows_client_preflight(backend: "WxBackend") -> Tuple[List[str], Optional[
         else:
             notes.append("主窗口处于最小化状态（自动还原失败，请手动展开）。")
 
-    if backend.kind == "own":
-        # 自研后端不使用客户端的 UIA 控件树，因此不受"免费版客户端版本上限"约束，
-        # 也不需要 Plus 授权；上面这些客户端信息只作为诊断输出。
-        return notes, None
-
-    if backend.is_plus:
-        license_problem = plus_license_dir_problem()
-        if license_problem:
-            return notes, license_problem
-        return notes, None
-
-    problem = free_backend_version_problem(normalized)
-    if problem:
-        return notes, problem
+    # 自研后端不读取微信的 UIA 控件树（它在新版客户端上根本不存在），
+    # 而是靠窗口激活 + 合成键鼠 + 截图/OCR 操作界面，因此不存在
+    # "客户端版本上限"或"授权"问题；客户端信息仅作为诊断输出。
     return notes, None
 
 
@@ -780,153 +590,81 @@ def windows_client_preflight(backend: "WxBackend") -> Tuple[List[str], Optional[
 # --------------------------------------------------------------------------- #
 @dataclass
 class WxBackend:
-    """实际使用的微信自动化后端。"""
+    """实际使用的微信自动化后端（自研 RPA 实现）。"""
 
     module_name: str
     label: str
-    is_plus: bool
     wechat_class: object
-    kind: str = "wxauto"     # wxauto（免费/Plus）| own（自研：窗口+键鼠+OCR）
+    kind: str = "own"        # own = 自研：窗口激活 + 合成键鼠 + 截图/OCR
 
 
 _BACKEND: Optional[WxBackend] = None
 
 
 def load_wx_backend() -> WxBackend:
-    """选择并导入后端：默认优先 Plus 版（wxautox4），没装则回落免费版。
+    """加载自研 RPA 后端 ``wechat_win.WinWeChat``。
 
-    Plus 版跟随新版微信客户端更新，免费版的客户端兼容上限明显更低，
-    所以「装了 Plus 就用 Plus」是最不容易失败的顺序。
-    可用 ``SEND_TO_FILEHELPER_WX_BACKEND=free|plus|own`` 强制指定；
-    ``own`` 是自研后端（不使用微信的 UIA 控件树，见 wechat_win.py）。
+    本 skill 不依赖任何第三方微信自动化包（wxauto4/wxautox4 已不再使用：
+    它们靠微信客户端的 UIA 控件树工作，而新版客户端不再暴露该控件树）。
+    后端逻辑全部在本 skill 的 ``scripts/wechat_win.py`` 里自研实现。
     """
     global _BACKEND
     if _BACKEND is not None:
         return _BACKEND
 
-    # 必须在 import 后端之前装好推广过滤与原始流记录：
-    # 免费版在 import / 构造时都可能打印推广。
-    silence_wxauto_ads()
+    forced = os.environ.get(WX_BACKEND_ENV, "own").strip().lower()
+    if forced not in ("", "auto", "own", "self", "builtin", "rpa"):
+        raise RuntimeError(
+            f"{WX_BACKEND_ENV}={forced} 已不再支持：本 skill 只提供自研 RPA 后端。\n"
+            "  请去掉该环境变量（或设为 own）。"
+        )
 
-    forced = os.environ.get(WX_BACKEND_ENV, "auto").strip().lower()
-
-    if forced in ("own", "self", "builtin"):
-        try:
-            from wechat_win import WinWeChat  # type: ignore import-not-found
-        except ImportError as exc:
-            raise RuntimeError(
-                f"未能导入自研后端 wechat_win（{exc}）。请在 skill 目录下运行，"
-                "并确认 scripts/wechat_win.py 存在。"
-            ) from exc
-        _BACKEND = WxBackend("wechat_win", "自研（窗口+键鼠+OCR）", False, WinWeChat, "own")
-        return _BACKEND
-
-    candidates = [
-        ("wxautox4", "wxautox4（Plus 版）", True),
-        ("wxauto4", "wxauto4（免费版）", False),
-    ]
-    if forced in ("free", "wxauto4"):
-        candidates = [candidates[1]]
-    elif forced in ("plus", "wxautox4"):
-        candidates = [candidates[0]]
-
-    problems: List[str] = []
-    for module_name, label, is_plus in candidates:
-        try:
-            module = importlib.import_module(module_name)
-        except Exception as exc:  # 未安装 / 激活失败等
-            problems.append(f"{label}: {type(exc).__name__}: {exc}")
-            continue
-        wechat_class = getattr(module, "WeChat", None)
-        if wechat_class is None:
-            problems.append(f"{label}: 模块中没有 WeChat")
-            continue
-        _BACKEND = WxBackend(module_name, label, is_plus, wechat_class)
-        return _BACKEND
-
-    detail = "".join(f"  - {item}\n" for item in problems)
-    raise RuntimeError(
-        "未能导入微信自动化后端。请确认在 Windows 上执行，并已安装依赖：\n"
-        "  免费版：uv run scripts/send_to_filehelper.py --help\n"
-        "  Plus 版：uv run --with wxautox4 scripts/send_to_filehelper.py ...\n"
-        f"尝试过的后端：\n{detail}"
-    )
-
-
-def _construct_client(backend: WxBackend):
-    """构造客户端。
-
-    ``ads=False`` 关闭 wxauto4 免费版打印的推广横幅；该横幅由编译后的扩展
-    直接写底层 stdout，Python 层的过滤器拦不住，只有这个开关有效。
-    旧版本不认识这个参数时退回无参调用。自研后端不需要该参数。
-    """
-    if backend.kind == "own":
-        return backend.wechat_class()
+    scripts_dir = str(Path(__file__).resolve().parent)
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
     try:
-        return backend.wechat_class(ads=False)
-    except TypeError:
-        return backend.wechat_class()
+        from wechat_win import WinWeChat  # type: ignore import-not-found
+    except ImportError as exc:
+        raise RuntimeError(
+            f"未能导入自研后端 wechat_win（{exc}）。请在 skill 目录下运行，"
+            "并确认 scripts/wechat_win.py 存在。"
+        ) from exc
+
+    _BACKEND = WxBackend("wechat_win", "自研（窗口+键鼠+OCR）", WinWeChat, "own")
+    return _BACKEND
 
 
 def _connect_error_message(exc: object, backend: WxBackend) -> str:
-    if isinstance(exc, SystemExit):
-        # Plus 版未激活时会直接 sys.exit()，其退出码本身没有信息量
-        text = f"后端直接退出（退出码 {exc.code}）"
-    else:
-        text = str(exc)
+    text = str(exc)
     lines = [
         "无法连接微信 PC 客户端。请确认：",
         f"  1. 已安装并登录 Windows 版微信（当前后端: {backend.label}）；",
-        "  2. 微信主窗口已打开且未最小化到托盘；",
-        "  3. 当前会话已解锁（远程桌面断开会话会导致 UI Automation 取不到控件）。",
+        "  2. 微信主窗口已打开且未最小化到托盘（本后端是 RPA：需要真实窗口）；",
+        "  3. 当前会话已解锁（锁屏/远程桌面断开时无法合成鼠标键盘）。",
     ]
-
-    hints: List[str] = []
-    if backend.is_plus:
-        hints.append(
-            "Plus 版需要先激活: wxautox4 auth activate <激活码>"
-            f"（文档: {WXAUTO4_PLUS_DOCS_URL}）；"
-            "若在沙箱/受限环境里运行，授权状态读不到，也会表现为未激活"
-        )
-    if "未找到已登录的客户端主窗口" in text:
-        hints.append(
-            "该报错表示后端拿不到微信的 UIA 控件树（mmui::*），通常是客户端版本不受支持："
-            f"免费版官方上限 {format_version(WXAUTO4_FREE_MAX_CLIENT)}；"
-            "实测客户端 4.1.12.55 连 Plus 版也找不到主窗口。\n"
-            f"     请换用受支持的客户端: {WXAUTO4_FREE_CLIENT_URL}"
-        )
-    for index, hint in enumerate(hints, start=4):
-        lines.append(f"  {index}. {hint}")
-
     lines.append(f"原始错误: {text}")
     return "\n".join(lines)
 
 
 def open_wechat():
-    silence_wxauto_ads()
     backend = load_wx_backend()
-    if backend.kind != "own":
-        configure_wxauto_privacy(backend.module_name)
 
     if sys.platform == "win32":
         if os.environ.get(SKIP_CLIENT_CHECK_ENV):
             info(f"已跳过客户端预检（{SKIP_CLIENT_CHECK_ENV} 已设置）")
         else:
-            # 预检要在构造客户端之前做完：客户端版本不受支持时，
-            # WeChat() 会白等约 120 秒再抛一个误导性的错误。
-            notes, blocked = windows_client_preflight(backend)
+            # 预检要在构造客户端之前做完，尽早给出「微信没开/主窗口在托盘」这类结论。
+            notes, blocked = windows_client_preflight()
             for line in notes:
                 info(line)
             if blocked:
                 raise RuntimeError(blocked)
 
     try:
-        return _construct_client(backend)
+        return backend.wechat_class()
     except KeyboardInterrupt:
         raise
     except (Exception, SystemExit) as exc:
-        # 未登录 / 未启动 / 版本不兼容都会走到这里；
-        # Plus 版未激活时是直接 sys.exit()，所以 SystemExit 也要接住。
         raise RuntimeError(_connect_error_message(exc, backend)) from exc
 
 
@@ -1093,7 +831,7 @@ def _expected_labels(files: Sequence[Path], texts: Sequence[str]) -> List[str]:
 
 
 # --------------------------------------------------------------------------- #
-# 平台后端：Windows（wxauto4）
+# 平台后端：Windows（自研 RPA）
 # --------------------------------------------------------------------------- #
 def run_windows_backend(
     files: Sequence[Path],
@@ -1118,7 +856,7 @@ def run_windows_backend(
         return report
 
     # 自研后端把校验做在 SendMsg 内部，必须穿透进去才省得掉那些等待。
-    # 用属性而不是关键字：wxauto4/wxautox4 的 SendMsg 签名不认 verify，传了会 TypeError。
+    # 用属性而不是关键字，保持与后端实现解耦（属性不存在时自动跳过）。
     #   --no-verify -> 只跳过发送后的结果复核
     #   --blind     -> 盲发：连发送前的输入框确认也跳过（并隐含 --no-verify）
     # 会话识别与硬校验（防发错人）两者都不受影响。
@@ -1394,7 +1132,11 @@ def check_environment(debug: bool = False) -> int:
     problems: List[str] = []
 
     if platform == "win32":
-        info("平台: Windows（后端: 微信 UI Automation）")
+        info("平台: Windows（后端: 自研 RPA：窗口 + 合成键鼠 + 截图/OCR）")
+        info(
+            "前置条件: 微信已登录且主窗口可见（不要最小化/留在托盘）、"
+            "桌面已解锁、运行期间不要动鼠标键盘；建议先手动打开目标会话。"
+        )
         try:
             backend = load_wx_backend()
         except RuntimeError as exc:
@@ -1416,12 +1158,24 @@ def check_environment(debug: bool = False) -> int:
         ok(f"当前会话: {chat_info.get('chat_name') or '未知'}")
         try:
             module = importlib.import_module(backend.module_name)
-            version = getattr(module, "__version__", None)
+            source = getattr(module, "__file__", None)
+            if source:
+                info(f"后端实现: {source}")
+            # OCR 是本后端的"眼睛"：没有它就读不到任何地标，必须显式报出来
+            if module.ocr_available():
+                ok("Windows OCR: 可用")
+            else:
+                problems.append(
+                    "Windows OCR 不可用（缺少 winrt 系列包）：本后端靠 OCR 定位界面地标，"
+                    "没有它无法工作。请用 uv 运行（脚本头部已声明依赖）。"
+                )
+        except Exception as exc:
+            problems.append(f"检查后端模块失败: {exc}")
 
-            if version:
-                info(f"{backend.module_name} 版本: {version}")
-        except Exception:
-            pass
+        if problems:
+            for item in problems:
+                fail(item)
+            return 1
         return 0
 
     if platform == "darwin":
@@ -1642,15 +1396,6 @@ def check_environment(debug: bool = False) -> int:
     help="macOS 输入方式：auto 自动选择；ax 只用辅助功能；keystrokes 只用键盘（Windows 忽略）。",
 )
 @click.option(
-    "--wx-backend",
-    "wx_backend",
-    type=click.Choice(["auto", "free", "plus", "own"]),
-    default="auto",
-    show_default=True,
-    help="Windows 后端：auto 自动（优先 Plus）/ free=wxauto4 / plus=wxautox4 / "
-         "own=自研（窗口+键鼠+OCR，不依赖微信 UIA 控件树）。",
-)
-@click.option(
     "-q",
     "--quiet",
     is_flag=True,
@@ -1684,7 +1429,6 @@ def main(
     dry_run: bool,
     check_only: bool,
     input_mode: str,
-    wx_backend: str,
     quiet: bool,
     debug: bool,
     as_json: bool,
@@ -1692,8 +1436,6 @@ def main(
     """把本地文件 / 文本发送到微信文件传输助手或指定会话（Windows / macOS）。"""
     enable_utf8_output()
     set_quiet(quiet)
-    if wx_backend and wx_backend != "auto":
-        os.environ[WX_BACKEND_ENV] = wx_backend
 
     if check_only:
         sys.exit(check_environment(debug=debug))
@@ -1761,7 +1503,8 @@ def main(
 
     if platform not in ("win32", "darwin") and not os.environ.get(PLATFORM_ESCAPE_ENV):
         fail(
-            f"不支持的平台: {platform}。仅支持 Windows（wxauto4）与 macOS（辅助功能）。"
+            f"不支持的平台: {platform}。仅支持 Windows（RPA：窗口+键鼠+OCR）"
+            "与 macOS（辅助功能）。"
         )
         sys.exit(1)
 
