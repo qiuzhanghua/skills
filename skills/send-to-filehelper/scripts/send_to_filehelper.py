@@ -69,6 +69,8 @@ FORCE_BACKEND_ENV = "SEND_TO_FILEHELPER_BACKEND"
 WX_BACKEND_ENV = "SEND_TO_FILEHELPER_WX_BACKEND"
 # 跳过 Windows 客户端预检
 SKIP_CLIENT_CHECK_ENV = "SEND_TO_FILEHELPER_SKIP_CLIENT_CHECK"
+# 打印后端各环节耗时（排障/调优）
+TIMING_ENV = "SEND_TO_FILEHELPER_TIMING"
 
 # Windows 上正在运行的微信客户端进程名（4.x 为 Weixin.exe，3.x 为 WeChat.exe）
 WECHAT_CLIENT_EXES = ("weixin.exe", "wechat.exe")
@@ -132,6 +134,18 @@ def warn(message: str) -> None:
 
 def fail(message: str) -> None:
     click.secho(f"错误: {message}", fg="red", err=True)
+
+
+def print_timing() -> None:
+    """打印后端各环节耗时（只在设了 SEND_TO_FILEHELPER_TIMING 时输出）。"""
+    if not os.environ.get(TIMING_ENV):
+        return
+    try:
+        import wechat_win
+    except Exception:
+        return
+    for line in wechat_win.timing_lines():
+        click.echo(line, err=True)
 
 
 def human_size(num_bytes: float) -> str:
@@ -919,11 +933,32 @@ def run_windows_backend(
         return report
 
     if not no_verify:
-        report.confirmed, report.unconfirmed, report.verify_note = verify_sent(
-            wx, sent, [*texts, *after_texts]
-        )
+        # 自研后端在发送时就逐条核对过了（SendMsg/SendFiles 内部的 _text_present，
+        # 用的是带 OCR 标点容错的 _match_any）。再让上层做一次整窗 OCR 复核：
+        #   * 慢——一次 _lines_union(3) 实测约 5 秒；
+        #   * 且只会制造假阴性——上层只按空白折叠比对，读不出 OCR 的标点变体
+        #     （`16:25:27` → `16 ： 25 ： 27`），于是"后端已确认"的消息被判成
+        #     "未在会话中发现任何内容"并以退出码 1 结束（实测踩到）。
+        # 所以这里采信后端的结论；后端没能核对上的项仍然如实报出来（只提示不判失败）。
+        self_confirmed = list(getattr(wx, "self_confirmed", None) or [])
+        self_missing = list(getattr(wx, "self_missing", None) or [])
+        if self_confirmed or self_missing:
+            # 后端记录的是**原始内容**（文件名 / 文本原文），这里换回给用户看的标签
+            pairs: List[Tuple[str, str]] = [(path.name, path.name) for path in sent]
+            pairs += [(_text_label(text), text) for text in [*texts, *after_texts]]
+            report.confirmed = [label for label, source in pairs if source in self_confirmed]
+            report.unconfirmed = [label for label, source in pairs if source in self_missing]
+            report.verify_note = getattr(wx, "verify_note", None)
+            if report.unconfirmed and not report.verify_note:
+                report.verify_note = (
+                    "以下内容发送时未能 OCR 复核到（微信重绘较慢时会这样，"
+                    "不代表没发出去）: " + "、".join(report.unconfirmed)
+                )
+        else:
+            report.confirmed, report.unconfirmed, report.verify_note = verify_sent(
+                wx, sent, [*texts, *after_texts]
+            )
     return report
-
 
 # --------------------------------------------------------------------------- #
 # 平台后端：macOS（Accessibility API）
@@ -1396,6 +1431,12 @@ def check_environment(debug: bool = False) -> int:
     help="macOS 输入方式：auto 自动选择；ax 只用辅助功能；keystrokes 只用键盘（Windows 忽略）。",
 )
 @click.option(
+    "--timing",
+    is_flag=True,
+    default=False,
+    help="打印后端各环节耗时（窗口截图/OCR/合成点击等），用于排障与提速（Windows）。",
+)
+@click.option(
     "-q",
     "--quiet",
     is_flag=True,
@@ -1429,6 +1470,7 @@ def main(
     dry_run: bool,
     check_only: bool,
     input_mode: str,
+    timing: bool,
     quiet: bool,
     debug: bool,
     as_json: bool,
@@ -1436,9 +1478,14 @@ def main(
     """把本地文件 / 文本发送到微信文件传输助手或指定会话（Windows / macOS）。"""
     enable_utf8_output()
     set_quiet(quiet)
+    if timing:
+        # 后端在 import 时读取这个变量，必须赶在 load_wx_backend() 之前设置
+        os.environ[TIMING_ENV] = "1"
 
     if check_only:
-        sys.exit(check_environment(debug=debug))
+        code = check_environment(debug=debug)
+        print_timing()
+        sys.exit(code)
 
     if debug and sys.platform == "darwin":
         import wechat_mac
@@ -1549,6 +1596,7 @@ def main(
         fail(report.abort)
         if report.candidates:
             info("候选会话（可用于修正 --to）: " + "、".join(report.candidates[:10]))
+        print_timing()
         sys.exit(1)
 
     # ---- 汇总 ----
@@ -1582,6 +1630,8 @@ def main(
     }
     if as_json:
         click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+    print_timing()
 
     if report.errors:
         sys.exit(1)
