@@ -6,6 +6,7 @@
 - tdp-plugin-backup
 - tdp-plugin-restore
 - send-to-filehelper
+- dev-env-inventory
 
 ## Usage
 
