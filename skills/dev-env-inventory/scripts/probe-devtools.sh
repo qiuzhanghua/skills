@@ -10,6 +10,32 @@
 # 输出：tool <TAB> path <TAB> version
 set -u
 
+# --- 兼容层：BSD/macOS 没有 GNU timeout（macOS 连 gtimeout 也没有）---
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_BIN=timeout
+elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_BIN=gtimeout
+else
+    TIMEOUT_BIN=""
+fi
+
+# 带超时地跑一条命令：优先后台守卫 + kill -9，macOS 上不需要 brew install coreutils。
+# 守卫子壳的 fd 必须挪出管道，否则它会替管道多活满 secs 秒（实测：不加会从 44 秒劣化到 5 分钟以上）。
+_t() {
+    local secs="$1"; shift
+    if [ -n "$TIMEOUT_BIN" ]; then
+        "$TIMEOUT_BIN" "$secs" "$@"
+        return
+    fi
+    "$@" </dev/null &
+    local p=$! w
+    ( sleep "$secs"; kill -9 "$p" 2>/dev/null ) >/dev/null 2>&1 & w=$!
+    wait "$p" 2>/dev/null
+    kill "$w" 2>/dev/null
+    wait "$w" 2>/dev/null
+    return 0
+}
+
 SHOW_MISSING=0
 SHOW_DIRS=0
 PROBE_WINDOWS=1
@@ -36,7 +62,7 @@ version_of() {
         *)       set -- --version -version -V version -v ;;
     esac
     for flag in "$@"; do
-        out="$(timeout 6 "$cmd" "$flag" </dev/null 2>&1 \
+        out="$(_t 6 "$cmd" "$flag" </dev/null 2>&1 \
                | tr -d '\r' | grep -v '^$' | head -n 2 | paste -sd' | ' -)"
         [ -n "$out" ] && break
     done

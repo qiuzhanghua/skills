@@ -56,7 +56,7 @@ Set-Alias -Name c -Value Invoke-CotActivate
    pwsh -NoLogo -Command 'c *> $null; $Env:PATH -split ";"'      # PATH 逐行，便于看顺序与去重
    ```
 
-   Linux / WSL（zsh）：
+   Linux / macOS / WSL（zsh）：
 
    ```bash
    zsh -lic 'env' | sort > /tmp/env-before-c.txt
@@ -78,7 +78,7 @@ Set-Alias -Name c -Value Invoke-CotActivate
    #   -Activate   探测前先 dot-source ~/cot/bin/activate.ps1（-NoProfile 会话里没有 c 时用）
    ```
 
-   Linux / WSL（bash）：
+   Linux / macOS / WSL（bash）：
 
    ```bash
    zsh -lic 'c >/dev/null 2>&1; exec bash <skill>/scripts/probe-devtools.sh'
@@ -126,7 +126,8 @@ Set-Alias -Name c -Value Invoke-CotActivate
 
 - **受限环境下包管理器缓存可能只读**：`uv run`/`uvx` 会报 `Could not acquire lock ... Read-only file system`。把 `UV_CACHE_DIR`（必要时还有 `UV_TOOL_DIR`/`UV_TOOL_BIN_DIR`/`UV_PYTHON_INSTALL_DIR`）指到可写目录即可。
 - 交互式 rc 可能打印无关告警（例如 oh-my-posh 建不了缓存目录），忽略即可。
-- 探测一定加超时并把标准输入关掉（bash 用 `timeout … </dev/null`，Windows 脚本用 .NET Process + 关闭 stdin）：个别工具或包装脚本会挂在读标准输入上。
+- 探测一定加超时并把标准输入关掉（bash 用脚本自带的 `_t … </dev/null`，Windows 脚本用 .NET Process + 关闭 stdin）：个别工具或包装脚本会挂在读标准输入上。
+- **macOS 没有 GNU `timeout`**（也不带 `gtimeout`，除非自己 `brew install coreutils`）：`probe-devtools.sh` 自带纯 bash 兜底，macOS 上零依赖即可跑（实测 91 行输出、44 秒完成）。写兜底时守卫子壳的 fd 必须挪出管道，否则它替管道多活满超时秒数——实测会从 44 秒劣化成 5 分钟以上。
 - 有的工具不认 `--version`（`go version`、`openssl version`、`ssh -V`、`java -version`），要按工具换写法——两个脚本都做了特例表。
 - **"运行期错误"和"没安装"是两回事**：容器/GPU 类工具在受限环境会打印错误（`podman` 的 `/run/user/1000` 只读、`nvidia-smi` 的 NVML 被拦），版本照样能从 `--version` 拿到；反过来 `rust-analyzer.exe` 存在也可能因为组件没装而只回 rustup proxy 的报错。
 - **别把报错当版本**：有的工具对未知参数只回一句报错，甚至把参数当文件名去打开（`gofmt -version` 报 flag 错，裸参数 `version` 变成"找不到文件"）。这类输出要过滤掉，宁可记 `(无版本输出)`。
