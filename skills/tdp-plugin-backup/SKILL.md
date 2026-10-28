@@ -3,41 +3,55 @@ name: tdp-plugin-backup
 description: Backup TDP plugins to an external USB drive. Triggers when the user mentions backing up, copying, or syncing plugin data to a USB drive or external storage. Handles both origin resources and plugin files. Use this skill whenever the user wants to save their TDP plugin files to a USB drive.
 ---
 
-## Overview
+# TDP Plugin Backup (local → USB)
 
-This skill backs up a specified TDP plugin from local storage to an external USB drive.
+Back up one TDP plugin from the local `tdp-scripts` tree to the mounted USB drive.
 
-**Local paths:**
-- Origin: `~/space/tdp-scripts/origin/<plugin name>/`
-- Plugin: `~/space/tdp-scripts/plugin/<plugin name>_*`
-- Bin: `~/space/tdp-scripts/bin/<plugin name>_*`
+## Paths
 
-**USB paths:**
-- Mac: `/Volumes/SanDisk/origin/`, `/Volumes/SanDisk/plugin/`, `/Volumes/SanDisk/bin/`
-- Linux: `/mnt/f/origin/`, `/mnt/f/plugin/`, `/mnt/f/bin/`
+Local root: `$TDP_LOCAL_ROOT` (default `~/space/tdp-scripts`)
 
-**Rules:**
-- No compression
-- Check if source exists before copying; if not, report and skip
-- Delete all existing files in the target before copying
-- Copy recursively
-- Auto-detect OS to choose USB path
+- `origin/<plugin>/` — origin resources (directory)
+- `plugin/<plugin>_*` — plugin archives
+- `bin/<plugin>_*` — executables
+
+USB root: `$TDP_USB_ROOT`, otherwise auto-detected by `scripts/usb-root.sh`:
+
+1. volume label `SanDisk` or `TDP` (via `lsblk`), then
+   `/media/$USER/<label>`, `/run/media/$USER/<label>`, `/Volumes/<label>` (macOS)
+2. fallback `/mnt/f`, `/mnt/usb` (Windows-style mount)
+
+On this machine the USB is `/media/q/SanDisk` (exFAT, label `SanDisk`).
 
 ## Usage
 
-When the user requests a backup operation, extract the **plugin name** from their request.
+```bash
+scripts/backup.sh <plugin>             # 实际备份
+scripts/backup.sh --dry-run <plugin>   # 只打印计划，不写入
+scripts/backup.sh gridcraft
+```
 
-### Backup (local → USB)
+The plugin name may contain letters, digits, `.`, `_`, `+`, `-`; anything else is
+rejected (exit 2) so a name can never turn into a glob.
 
-1. Detect OS and set USB base path accordingly
-2. Verify USB paths exist; if not, prompt the user to connect the USB drive
-3. For `origin`, `plugin`, and `bin` directories:
-   a. Remove all contents at the USB destination for this plugin
-   b. Copy the local plugin directory/file to the USB destination recursively
-4. Report completion with summary of what was copied
+## What the script does
 
-## Error Handling
+1. Resolves the USB root; fails with a clear message if the drive is not mounted.
+2. `origin/<plugin>`: copies to `<dst>.new`, verifies with `diff -r`, then replaces
+   the destination.
+3. `plugin/<plugin>_*` and `bin/<plugin>_*`: copies to `.tdpnew-*` staging names,
+   verifies with `cmp`, deletes only the old `<plugin>_*` files, then moves the
+   staged files into place.
+4. `sync`s the USB and prints how many files were copied per section.
+5. Exits 1 when the plugin has no local `origin/plugin/bin` files.
 
-- If the USB drive is not mounted, tell the user to connect it and wait
-- If a plugin does not exist on the source, report it and skip
-- If a plugin does not exist on the target, create the parent directories as needed
+## Safety notes
+
+- Only files belonging to the requested plugin are removed (its `origin/<plugin>`
+  directory and `<plugin>_*` files); other plugins are untouched.
+- Staging + verification happen **before** anything is deleted, so a failed copy
+  leaves the previous backup intact.
+- exFAT has no permissions or symlinks; files are copied as-is (this repo has no
+  symlinked plugin files).
+- Writing to `/media/...` is outside the workspace sandbox: run the script with
+  full file access, otherwise `cp` fails with “权限不够”.
