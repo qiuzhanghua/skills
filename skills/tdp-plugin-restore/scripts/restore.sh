@@ -31,8 +31,11 @@ fi
 valid_name() { case "$1" in ''|*[!A-Za-z0-9._+-]*) return 1 ;; esac; }
 
 derive_name() {
-  local base="$1"
-  [[ "$base" =~ ^(.+?)_[0-9][^_]*_ ]] && printf '%s\n' "${BASH_REMATCH[1]}"
+  # 从左往右找第一个 "_<数字>..._" 作为版本起点；不用正则的非贪婪，
+  # POSIX ERE 不支持 .+?，贪婪会把 _386_、_riscv64_ 这类架构数字误当版本。
+  local base="$1" name
+  name="$(printf '%s\n' "$base" | sed -E 's/_[0-9][^_]*_.*$//')"
+  [ "$name" != "$base" ] && printf '%s\n' "$name"
 }
 
 version_of_name() {
