@@ -59,6 +59,25 @@ the rest; the script exits non-zero if any failed.
 4. `sync`s the USB and prints how many files were copied per plugin.
 5. Exits 1 when the plugin has no local `origin/plugin/bin` files.
 
+## Version rules
+
+The source side decides whether a section is copied:
+
+- **Source has one version** → compare it with the destination's highest version:
+  - source is higher → replace the destination files for this plugin
+  - source is lower or equal → skip, keep the destination (no downgrade)
+- **Source has multiple versions** → copy all of them, replacing the destination's
+  file set for this plugin (the same as "mirror the source").
+- No version can be parsed, or the destination is missing → normal copy.
+
+Versions come from file names: `origin` files such as
+`deckcraft-0.10.0-linux-x86_64.tar.gz` / `node-v20.20.2-linux-x64.tar.gz`, and
+`plugin`/`bin` names such as `gridcraft_0.11.1_linux_amd64.tar.zst`. A leading `v`
+is accepted; comparison is numeric dotted (`0.10.0` > `0.9.0`), and suffixes after
+the numeric part are ignored.
+
+Per-plugin output shows either `跳过：源 X <= 目标 Y` or the copy that happened.
+
 ## Safety notes
 
 - Only files belonging to the requested plugin are removed (its `origin/<plugin>`

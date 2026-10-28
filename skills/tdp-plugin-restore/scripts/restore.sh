@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # TDP 插件恢复：U 盘 -> 本地 tdp-scripts。
 # 用法: restore.sh [--dry-run] <plugin>|--all
+#
+# 版本规则：
+#   源只有 1 个版本 -> 与目标最高版本比较，源更高才替换，否则跳过
+#   源有多个版本   -> 全量复制（覆盖目标该插件的文件）
 set -euo pipefail
 shopt -s nullglob
 
@@ -26,10 +30,65 @@ fi
 
 valid_name() { case "$1" in ''|*[!A-Za-z0-9._+-]*) return 1 ;; esac; }
 
-# <name>_<version>_<os>_... -> <name>；版本以数字开头，名字里可以有下划线
 derive_name() {
   local base="$1"
   [[ "$base" =~ ^(.+?)_[0-9][^_]*_ ]] && printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+version_of_name() {
+  local base="$1"
+  if [[ "$base" =~ v([0-9]+(\.[0-9]+)+) ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"; return 0
+  fi
+  if [[ "$base" =~ ([0-9]+(\.[0-9]+)+) ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"; return 0
+  fi
+  return 1
+}
+
+version_gt() {
+  local a="${1#v}" b="${2#v}"
+  local -a A B
+  local IFS='.'; A=($a); B=($b)
+  local i n=${#A[@]}
+  [ ${#B[@]} -gt $n ] && n=${#B[@]}
+  for ((i = 0; i < n; i++)); do
+    local x="${A[i]:-0}" y="${B[i]:-0}"
+    x="${x%%[!0-9]*}"; y="${y%%[!0-9]*}"
+    x="${x:-0}"; y="${y:-0}"
+    if ((10#$x > 10#$y)); then return 0; fi
+    if ((10#$x < 10#$y)); then return 1; fi
+  done
+  return 1
+}
+
+max_version() {
+  local best="" v
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    if [ -z "$best" ] || version_gt "$v" "$best"; then best="$v"; fi
+  done
+  printf '%s\n' "$best"
+}
+
+versions_of_paths() {
+  local p
+  for p in "$@"; do
+    [ -f "$p" ] || continue
+    version_of_name "$(basename -- "$p")" || true
+  done | sort -u
+}
+
+should_replace() {
+  local src_list="$1" dst_list="$2"
+  local src_n src_one dst_max
+  src_n=$(printf '%s\n' "$src_list" | sed '/^$/d' | wc -l)
+  [ "$src_n" -le 1 ] || return 0
+  src_one=$(printf '%s\n' "$src_list" | sed '/^$/d' | head -1)
+  dst_max=$(printf '%s\n' "$dst_list" | sed '/^$/d' | max_version)
+  [ -z "$dst_max" ] && return 0
+  [ -z "$src_one" ] && return 0
+  version_gt "$src_one" "$dst_max"
 }
 
 list_usb_plugins() {
@@ -52,6 +111,18 @@ copy_section() {
   local files=("$USB_ROOT/$kind/${plugin}_"*)
   [ ${#files[@]} -gt 0 ] || return 1
   local dstdir="$LOCAL_ROOT/$kind"
+  local dstfiles=("$dstdir/${plugin}_"*)
+
+  local src_list dst_list
+  src_list=$(versions_of_paths "${files[@]}")
+  dst_list=$(versions_of_paths "${dstfiles[@]}")
+  if ! should_replace "$src_list" "$dst_list"; then
+    printf '  %s 跳过：源 %s <= 目标 %s\n' "$kind" \
+      "$(printf '%s\n' "$src_list" | sed '/^$/d' | max_version)" \
+      "$(printf '%s\n' "$dst_list" | sed '/^$/d' | max_version)"
+    return 0
+  fi
+
   printf '  %s -> %s (%d files)\n' "$kind" "$dstdir" "${#files[@]}"
   if [ "$DRY" = 0 ]; then
     mkdir -p -- "$dstdir"
@@ -79,17 +150,29 @@ restore_one() {
   if [ -d "$src" ]; then
     found=1
     local dst="$LOCAL_ROOT/origin/$plugin"
-    printf '  origin -> %s\n' "$dst"
-    if [ "$DRY" = 0 ]; then
-      mkdir -p -- "$LOCAL_ROOT/origin"
-      local tmp="$dst.new"
-      rm -rf -- "$tmp"
-      cp -r -- "$src" "$tmp"
-      diff -r -- "$src" "$tmp" >/dev/null || { echo "verify failed: origin" >&2; return 1; }
-      rm -rf -- "$dst"
-      mv -- "$tmp" "$dst"
+    local src_files=() dst_files=() p
+    while IFS= read -r p; do src_files+=("$p"); done < <(find "$src" -type f 2>/dev/null)
+    while IFS= read -r p; do dst_files+=("$p"); done < <(find "$dst" -type f 2>/dev/null)
+    local src_list dst_list
+    src_list=$(versions_of_paths "${src_files[@]}")
+    dst_list=$(versions_of_paths "${dst_files[@]}")
+    if ! should_replace "$src_list" "$dst_list"; then
+      printf '  origin 跳过：源 %s <= 目标 %s\n' \
+        "$(printf '%s\n' "$src_list" | sed '/^$/d' | max_version)" \
+        "$(printf '%s\n' "$dst_list" | sed '/^$/d' | max_version)"
+    else
+      printf '  origin -> %s\n' "$dst"
+      if [ "$DRY" = 0 ]; then
+        mkdir -p -- "$LOCAL_ROOT/origin"
+        local tmp="$dst.new"
+        rm -rf -- "$tmp"
+        cp -r -- "$src" "$tmp"
+        diff -r -- "$src" "$tmp" >/dev/null || { echo "verify failed: origin" >&2; return 1; }
+        rm -rf -- "$dst"
+        mv -- "$tmp" "$dst"
+      fi
+      origin_n=$(find "$src" -type f | wc -l)
     fi
-    origin_n=$(find "$src" -type f | wc -l)
   fi
 
   local kind
