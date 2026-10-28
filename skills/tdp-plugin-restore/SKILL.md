@@ -5,18 +5,24 @@ description: Restore TDP plugins from an external USB drive. Triggers when the u
 
 # TDP Plugin Restore (USB → local)
 
-Restore one TDP plugin from the mounted USB drive back into the local `tdp-scripts`
-tree.
+Restore one TDP plugin — or every plugin on the drive — from the mounted USB drive
+back into the local `tdp-scripts` tree.
 
 ## Paths
 
-USB root: `$TDP_USB_ROOT`, otherwise auto-detected by `scripts/usb-root.sh`:
+USB root: `$TDP_USB_ROOT`, otherwise `scripts/usb-root.sh` resolves it **without
+assuming a username**:
 
-1. volume label `SanDisk` or `TDP` (via `lsblk`), then
-   `/media/$USER/<label>`, `/run/media/$USER/<label>`, `/Volumes/<label>` (macOS)
-2. fallback `/mnt/f`, `/mnt/usb` (Windows-style mount)
+1. volume label `SanDisk` or `TDP`, taken from the mount table (`lsblk`), then
+   globs `/media/*/<label>`, `/run/media/*/<label>`, `/Volumes/<label>` (macOS)
+2. if the label is unknown but exactly one removable mount exists under
+   `/media/*/*` or `/run/media/*/*`, use it
+3. fallback `/mnt/f`, `/mnt/usb` (Windows-style mount)
+4. otherwise fail and list the candidates, asking for `TDP_USB_ROOT`
 
-On this machine the USB is `/media/q/SanDisk` (exFAT, label `SanDisk`).
+The mount point comes from the system, not from `$USER`/`whoami`: those are wrong
+under `sudo`, systemd units or cron. On this machine the drive is
+`/media/q/SanDisk` (exFAT, label `SanDisk`).
 
 Local root: `$TDP_LOCAL_ROOT` (default `~/space/tdp-scripts`)
 
@@ -27,13 +33,23 @@ Local root: `$TDP_LOCAL_ROOT` (default `~/space/tdp-scripts`)
 ## Usage
 
 ```bash
-scripts/restore.sh <plugin>             # 实际恢复
-scripts/restore.sh --dry-run <plugin>   # 只打印计划，不写入
-scripts/restore.sh gridcraft
+scripts/restore.sh <plugin>             # 恢复单个插件
+scripts/restore.sh --all                # 恢复 U 盘上的全部插件
+scripts/restore.sh --dry-run <plugin>   # 只打印计划
+scripts/restore.sh --all --dry-run      # 列出 U 盘上的插件与目标路径
 ```
 
-The plugin name may contain letters, digits, `.`, `_`, `+`, `-`; anything else is
+Plugin names may contain letters, digits, `.`, `_`, `+`, `-`; anything else is
 rejected (exit 2) so a name can never turn into a glob.
+
+`--all` derives the plugin list from `origin/*` on the USB plus the
+`<name>_<version>_<os>_<arch>...` prefixes of its `plugin/` and `bin/` files,
+dedupes them, then restores each. A per-plugin failure is reported and does not
+stop the rest; the script exits non-zero if any failed.
+
+**`--all` restores the whole backup volume** (here about 30 GB across 40+ plugins);
+run `--all --dry-run` first and make sure there is enough disk space. Prefer a
+single plugin name when recovering one thing.
 
 ## What the script does
 
@@ -43,7 +59,7 @@ rejected (exit 2) so a name can never turn into a glob.
 3. `plugin/<plugin>_*` and `bin/<plugin>_*`: copies to `.tdpnew-*` staging names,
    verifies with `cmp`, deletes only the old local `<plugin>_*` files, then moves
    the staged files into place.
-4. `sync`s and prints how many files were restored per section.
+4. `sync`s and prints how many files were restored per plugin.
 5. Exits 1 when the plugin is not present on the USB drive.
 
 ## Safety notes
