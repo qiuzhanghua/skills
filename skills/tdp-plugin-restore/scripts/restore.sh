@@ -1,22 +1,26 @@
 #!/usr/bin/env bash
 # TDP 插件恢复：U 盘 -> 本地 tdp-scripts。
-# 用法: restore.sh [--dry-run] <plugin>|--all
+# 用法: restore.sh [--dry-run] [--prune] <plugin>|--all
 #
-# 版本规则：
-#   源只有 1 个版本 -> 与目标最高版本比较，源更高才替换，否则跳过
-#   源有多个版本   -> 全量复制（覆盖目标该插件的文件）
+# 版本规则（按"目标缺哪个版本才补"判断，不再整份重拷）：
+#   目标缺源的某个版本        -> 重建这一节（覆盖目标该插件的文件）
+#   目标最高版本高于源        -> 跳过（不降级）
+#   目标已覆盖源的全部版本    -> 跳过，避免每次把几 GB 的 origin/ 缓存重写一遍
+# 加 --prune 时，目标上源里没有的旧文件会被删掉（只在目标不比源旧时）
 set -euo pipefail
 shopt -s nullglob
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DRY=0
 ALL=0
+PRUNE=0
 PLUGIN=""
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY=1 ;;
     --all) ALL=1 ;;
-    -h|--help) echo "usage: restore.sh [--dry-run] <plugin>|--all"; exit 0 ;;
+    --prune) PRUNE=1 ;;
+    -h|--help) echo "usage: restore.sh [--dry-run] [--prune] <plugin>|--all"; exit 0 ;;
     -*) echo "unknown option: $arg" >&2; exit 2 ;;
     *) [ -z "$PLUGIN" ] && PLUGIN="$arg" || { echo "too many arguments" >&2; exit 2; } ;;
   esac
@@ -25,7 +29,7 @@ if [ "$ALL" = 1 ] && [ -n "$PLUGIN" ]; then
   echo "--all 与插件名不能同时使用" >&2; exit 2
 fi
 if [ "$ALL" = 0 ] && [ -z "$PLUGIN" ]; then
-  echo "usage: restore.sh [--dry-run] <plugin>|--all" >&2; exit 2
+  echo "usage: restore.sh [--dry-run] [--prune] <plugin>|--all" >&2; exit 2
 fi
 
 valid_name() { case "$1" in ''|*[!A-Za-z0-9._+-]*) return 1 ;; esac; }
@@ -82,16 +86,55 @@ versions_of_paths() {
   done | sort -u
 }
 
+# 是否需要重建这一节：
+#   * 源没有版本信息、或目标为空        -> 复制
+#   * 目标最高版本比源高                -> 跳过（不降级）
+#   * 目标缺了源的某个版本              -> 复制（有新内容要落地）
+#   * 目标已覆盖源的所有版本、且不比源旧 -> 跳过
+# 早先的规则是"源里有多版本就整份重拷"，而 origin/ 天生会累积多个旧版本，
+# 于是每次备份/恢复都要重写几 GB 的下载缓存；改成缺哪个补哪个。
 should_replace() {
   local src_list="$1" dst_list="$2"
-  local src_n src_one dst_max
-  src_n=$(printf '%s\n' "$src_list" | sed '/^$/d' | wc -l)
-  [ "$src_n" -le 1 ] || return 0
-  src_one=$(printf '%s\n' "$src_list" | sed '/^$/d' | head -1)
+  local src_max dst_max v
+  src_max=$(printf '%s\n' "$src_list" | sed '/^$/d' | max_version)
   dst_max=$(printf '%s\n' "$dst_list" | sed '/^$/d' | max_version)
+  [ -z "$src_max" ] && return 0
   [ -z "$dst_max" ] && return 0
-  [ -z "$src_one" ] && return 0
-  version_gt "$src_one" "$dst_max"
+  version_gt "$dst_max" "$src_max" && return 1
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    printf '%s\n' "$dst_list" | sed '/^$/d' | grep -qxF -- "$v" || return 0
+  done <<<"$src_list"
+  return 1
+}
+
+
+# 目标不比源旧（可以安全做镜像式删除）
+not_older() {
+  local s d
+  s=$(printf '%s\n' "$1" | sed '/^$/d' | max_version)
+  d=$(printf '%s\n' "$2" | sed '/^$/d' | max_version)
+  [ -n "$d" ] || return 0
+  [ -n "$s" ] || return 1
+  ! version_gt "$d" "$s"
+}
+
+# --prune：删掉目标上源里没有的多余文件（仅限本插件）。
+# 只在 not_older 成立时调用，保证永远不会删掉比源更新的备份。
+prune_files() {
+  local -n _src="$1" _dst="$2"
+  local f s base keep
+  for f in "${_dst[@]}"; do
+    base=$(basename -- "$f")
+    keep=0
+    for s in "${_src[@]}"; do
+      if [ "$(basename -- "$s")" = "$base" ]; then keep=1; break; fi
+    done
+    if [ "$keep" = 1 ]; then continue; fi
+    printf '  prune %s\n' "$base"
+    if [ "$DRY" = 0 ]; then rm -f -- "$f"; fi
+  done
+  return 0
 }
 
 list_usb_plugins() {
@@ -123,6 +166,9 @@ copy_section() {
     printf '  %s 跳过：源 %s <= 目标 %s\n' "$kind" \
       "$(printf '%s\n' "$src_list" | sed '/^$/d' | max_version)" \
       "$(printf '%s\n' "$dst_list" | sed '/^$/d' | max_version)"
+    if [ "$PRUNE" = 1 ] && not_older "$src_list" "$dst_list"; then
+      prune_files files dstfiles
+    fi
     return 0
   fi
 
@@ -163,6 +209,9 @@ restore_one() {
       printf '  origin 跳过：源 %s <= 目标 %s\n' \
         "$(printf '%s\n' "$src_list" | sed '/^$/d' | max_version)" \
         "$(printf '%s\n' "$dst_list" | sed '/^$/d' | max_version)"
+      if [ "$PRUNE" = 1 ] && not_older "$src_list" "$dst_list"; then
+        prune_files src_files dst_files
+      fi
     else
       printf '  origin -> %s\n' "$dst"
       if [ "$DRY" = 0 ]; then

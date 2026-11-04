@@ -37,6 +37,7 @@ scripts/restore.sh <plugin>             # 恢复单个插件
 scripts/restore.sh --all                # 恢复 U 盘上的全部插件
 scripts/restore.sh --dry-run <plugin>   # 只打印计划
 scripts/restore.sh --all --dry-run      # 列出 U 盘上的插件与目标路径
+scripts/restore.sh --prune <plugin>     # 镜像式：删掉本地源里没有的旧文件
 ```
 
 Plugin names may contain letters, digits, `.`, `_`, `+`, `-`; anything else is
@@ -69,8 +70,11 @@ The source side decides whether a section is copied:
 - **Source has one version** → compare it with the destination's highest version:
   - source is higher → replace the destination files for this plugin
   - source is lower or equal → skip, keep the destination (no downgrade)
-- **Source has multiple versions** → copy all of them, replacing the destination's
-  file set for this plugin (the same as "mirror the source").
+- **Destination already has every source version** (and is not older) → skip the
+  whole section; only missing versions trigger a copy.
+- `--prune` deletes local files of that plugin that the USB drive does not have.
+  It only runs when the local copy is **not newer** than the source, so freshly
+  built local artifacts are never lost.
 - No version can be parsed, or the destination is missing → normal copy.
 
 Versions come from file names: `origin` files such as

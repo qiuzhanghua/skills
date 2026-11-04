@@ -38,6 +38,7 @@ scripts/backup.sh <plugin>             # 备份单个插件
 scripts/backup.sh --all                # 备份本地全部插件
 scripts/backup.sh --dry-run <plugin>   # 只打印计划
 scripts/backup.sh --all --dry-run      # 列出将要备份的插件
+scripts/backup.sh --prune <plugin>     # 镜像式：删掉目标上源里没有的旧文件
 ```
 
 Plugin names may contain letters, digits, `.`, `_`, `+`, `-`; anything else is
@@ -66,8 +67,12 @@ The source side decides whether a section is copied:
 - **Source has one version** → compare it with the destination's highest version:
   - source is higher → replace the destination files for this plugin
   - source is lower or equal → skip, keep the destination (no downgrade)
-- **Source has multiple versions** → copy all of them, replacing the destination's
-  file set for this plugin (the same as "mirror the source").
+- **Destination already has every source version** (and is not older) → skip the
+  whole section. This is what keeps a re-run cheap: `origin/` accumulates old
+  versions by design, and a full rewrite used to take minutes every time.
+- `--prune` deletes destination files of that plugin that the source no longer
+  has. It only runs when the destination is **not newer** than the source, so a
+  newer backup is never thrown away.
 - No version can be parsed, or the destination is missing → normal copy.
 
 Versions come from file names: `origin` files such as
